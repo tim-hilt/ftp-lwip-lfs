@@ -1,0 +1,107 @@
+# ftp-lwip-lfs
+
+A minimal FTP server for embedded systems, built on the [lwIP](https://savannah.nongnu.org/projects/lwip/) raw TCP API and backed by a [LittleFS](https://github.com/littlefs-project/littlefs) filesystem. It exposes a small C API (`ftp_server.h`) intended to be dropped into a microcontroller firmware project.
+
+## Features
+
+- Event-driven, non-blocking implementation using lwIP's raw (callback) API — no RTOS or blocking sockets required.
+- Serves files directly from an already-mounted LittleFS (`lfs_t`) instance.
+- Supports both passive (PASV) and active (PORT) data connections.
+- Optional username/password authentication.
+- Configurable number of concurrent client sessions.
+- Commands supported: `USER`, `PASS`, `SYST`, `FEAT`, `OPTS`, `TYPE`, `PWD`/`XPWD`, `CWD`/`XCWD`, `CDUP`/`XCUP`, `PASV`, `PORT`, `LIST`, `NLST`, `RETR`, `STOR`, `DELE`, `MKD`/`XMKD`, `RMD`/`XRMD`, `RNFR`, `RNTO`, `SIZE`, `NOOP`, `QUIT`, `ABOR`.
+
+## Files
+
+| File            | Purpose                                      |
+|-----------------|-----------------------------------------------|
+| `ftp_server.h`  | Public API and compile-time configuration.    |
+| `ftp_server.c`  | Server implementation (session/state machine, command dispatch, data transfer). |
+
+## Requirements
+
+- An lwIP stack (raw API) already initialized and running.
+- A LittleFS instance already mounted (`lfs_mount()` succeeded).
+- A working `tcp_*` callback-driven main loop (e.g. `sys_check_timeouts()` / lwIP's poll loop, or an RTOS lwIP port).
+
+## Building
+
+This is a plain C source/header pair with no build system of its own — add both files to your existing firmware build (Makefile, CMake, PlatformIO, etc.) alongside your lwIP and LittleFS sources, and ensure their include paths are visible:
+
+```
+your_project/
+├── lwip/            (lwip/tcp.h, lwip/err.h, ...)
+├── littlefs/         (lfs.h)
+└── ftp_server.c/.h   (this project)
+```
+
+Example CMake snippet:
+
+```cmake
+target_sources(firmware PRIVATE ftp_server.c)
+target_include_directories(firmware PRIVATE .)
+target_link_libraries(firmware PRIVATE lwipcore littlefs)
+```
+
+## Configuration
+
+Override any of these macros before including `ftp_server.h` (e.g. via a `-D` compiler flag or a project-wide config header):
+
+| Macro                            | Default | Description                                      |
+|-----------------------------------|---------|---------------------------------------------------|
+| `FTP_SERVER_PORT`                 | `21`    | Control connection port.                          |
+| `FTP_SERVER_PASV_PORT_MIN`        | `1024`  | First passive-mode data port.                     |
+| `FTP_SERVER_PASV_PORT_MAX`        | `1039`  | Last passive-mode data port.                      |
+| `FTP_SERVER_MAX_CLIENTS`          | `2`     | Maximum concurrent sessions.                      |
+| `FTP_SERVER_USER`                 | `NULL`  | Required username, or `NULL` to skip auth.        |
+| `FTP_SERVER_PASS`                 | `NULL`  | Required password, or `NULL` to skip auth.        |
+| `FTP_SERVER_DATA_BUF_SIZE`        | `512`   | Per-session transfer buffer size (bytes).         |
+| `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes).     |
+| `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length.                     |
+| `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must match `lfs_config.cache_size`. |
+| `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected. |
+
+## Usage
+
+```c
+#include "lfs.h"
+#include "ftp_server.h"
+
+lfs_t lfs;
+
+void app_init(void)
+{
+    /* 1. Mount your LittleFS filesystem. */
+    int err = lfs_mount(&lfs, &lfs_cfg);
+    if (err) {
+        /* handle mount failure, e.g. lfs_format() + retry */
+    }
+
+    /* 2. Start the FTP server on top of the mounted filesystem. */
+    if (ftp_server_init(&lfs) != ERR_OK) {
+        /* handle startup failure */
+    }
+
+    /* 3. Run your normal lwIP loop; the server operates entirely
+     *    through tcp_* callbacks and needs no extra polling. */
+}
+
+void app_shutdown(void)
+{
+    ftp_server_deinit();
+}
+```
+
+Then connect with any standard FTP client:
+
+```sh
+ftp <device-ip>
+```
+
+If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credentials; otherwise any `USER`/`PASS` is accepted.
+
+## Notes
+
+- Only one data connection is active per session at a time.
+- Each session's LFS file cache buffer size must match `lfs_config.cache_size` (`FTP_SERVER_FILE_CACHE_SIZE`).
+- Designed for constrained targets: no dynamic allocation beyond the static `s_sessions[FTP_SERVER_MAX_CLIENTS]` table.
