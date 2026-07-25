@@ -460,7 +460,7 @@ static void ftp_start_transfer(ftp_session_t *s)
         s->stor_active = 1;
         ftp_send_reply(s, "150 Ok to send data.\r\n");
     } else if (s->data_mode == FTP_DATA_RETR) {
-        char reply[FTP_SERVER_PATH_MAX + 64];
+        char reply[FTP_SERVER_PATH_MAX + 96];
         (void)snprintf(reply, sizeof(reply),
                  "150 Opening %s mode data connection for %s (%ld bytes).\r\n",
                  (s->type == 'I') ? "BINARY" : "ASCII",
