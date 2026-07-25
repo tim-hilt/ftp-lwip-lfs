@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: build (ftp_server compiles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build ftp_server
+        run: cmake --build build --target ftp_server -j
+
+  unit-tests:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFTP_SERVER_BUILD_TESTS=ON
+
+      - name: Build tests
+        run: cmake --build build --target ftp_tests -j
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+  clang-tidy:
+    name: static analysis (clang-tidy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build clang-tidy image
+        run: docker build -t ftp-lwip-lfs-clang-tidy .
+
+      - name: Run clang-tidy (ftp_server.c/.h only)
+        run: docker run --rm -v "${{ github.workspace }}":/repo ftp-lwip-lfs-clang-tidy

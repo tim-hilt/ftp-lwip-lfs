@@ -1247,7 +1247,7 @@ static err_t ftp_ctrl_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * restored afterwards instead of being permanently clobbered. */
         uint16_t saved_total = s->cmd_len;
         uint8_t  have_saved_byte = (line_len < saved_total);
-        char     saved_byte = have_saved_byte ? s->cmd_buf[line_len] : '\0';
+        char     saved_byte = (char)(have_saved_byte ? s->cmd_buf[line_len] : '\0');
         s->cmd_len = line_len;
 
         ftp_process_command(s);
