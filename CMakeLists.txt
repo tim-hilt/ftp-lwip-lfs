@@ -86,3 +86,64 @@ target_compile_options(ftp_server PRIVATE
 if(FTP_SERVER_ENABLE_CLANG_TIDY)
     set_target_properties(ftp_server PROPERTIES C_CLANG_TIDY "${FTP_SERVER_CLANG_TIDY_COMMAND}")
 endif()
+
+
+# --------------------------------------------------------------------
+# Unit tests (opt-in via -DFTP_SERVER_BUILD_TESTS=ON)
+# --------------------------------------------------------------------
+option(FTP_SERVER_BUILD_TESTS "Build unit tests with Catch2 + mock lwIP/LFS" OFF)
+if(FTP_SERVER_BUILD_TESTS)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+    find_package(Catch2 3 QUIET)
+    if(NOT Catch2_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+            Catch2
+            GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+            GIT_TAG        v3.8.0
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(Catch2)
+        list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+    endif()
+
+    # Mock library — provides stub lwIP + LFS implementations.
+    # Its include directory (tests/mock/) is PUBLIC so that consumers
+    # (ftp_server_testable, test executables) pick up the shadow headers
+    # instead of the real lwip/lfs ones.
+    add_library(ftp_mocks STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock/mock_lwip.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock/mock_lfs.c
+    )
+    target_include_directories(ftp_mocks PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock
+    )
+
+    # Re-compile ftp_server.c against mock headers.
+    # The key trick: ftp_mocks PUBLIC include path puts tests/mock/ on
+    # the search path BEFORE any real lwip/lfs directories, so
+    # #include "lwip/tcp.h" and #include "lfs.h" resolve to the mocks.
+    add_library(ftp_server_testable STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/ftp_server.c
+    )
+    target_include_directories(ftp_server_testable PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(ftp_server_testable PUBLIC ftp_mocks)
+
+    # Test executable — add your test .cpp files here.
+    add_executable(ftp_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp
+    )
+    target_link_libraries(ftp_tests PRIVATE
+        ftp_server_testable
+        Catch2::Catch2WithMain
+    )
+
+    include(CTest)
+    include(Catch)
+    catch_discover_tests(ftp_tests)
+endif()
