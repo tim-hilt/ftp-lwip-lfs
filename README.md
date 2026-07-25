@@ -62,7 +62,7 @@ Override any of these macros before including `ftp_server.h` (e.g. via a `-D` co
 | `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes).     |
 | `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length.                     |
 | `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must be >= `lfs_config.cache_size` (checked at `ftp_server_init()`). |
-| `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected. |
+| `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected. Traffic on either the control *or* the data connection counts as activity, so a long transfer is never cut short — only a stalled one. |
 
 ## Usage
 

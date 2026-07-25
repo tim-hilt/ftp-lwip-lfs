@@ -107,6 +107,10 @@ typedef struct ftp_session {
     uint8_t               file_open;
     uint8_t               dir_open;
 
+    /* Active mode: data_pcb is set but tcp_connect() has not completed yet,
+     * so it must not be treated as a usable data connection. */
+    uint8_t               data_connecting;
+
     /* STOR: flag that we are receiving data */
     uint8_t               stor_active;
 
@@ -121,7 +125,8 @@ typedef struct ftp_session {
 
     char                  cmd_buf[FTP_SERVER_CMD_BUF_SIZE];
 
-    /* Working directory (always starts and ends with '/') */
+    /* Working directory: absolute and normalised, with no trailing '/'
+     * except at the root, which is "/". */
     char                  cwd[FTP_SERVER_PATH_MAX];
 
     /* Pending RNFR path (set by RNFR, consumed by RNTO) */
@@ -228,7 +233,9 @@ static int ftp_resolve_path(const ftp_session_t *s, const char *arg, char *out)
 
     char tmp[FTP_SERVER_PATH_MAX];
     if (arg[0] == '/') {
-        /* Absolute path */
+        /* Absolute path. Truncating here would silently address a *different*
+         * existing path (a prefix of the requested one), so reject instead. */
+        if (strlen(arg) >= sizeof(tmp)) return -1;
         ftp_strlcpy(tmp, arg, sizeof(tmp));
     } else {
         /* Relative to cwd */
@@ -364,6 +371,7 @@ static void ftp_close_data(ftp_session_t *s)
 {
     if (ftp_close_pcb(&s->data_pcb, 0)) s->data_aborted = 1;
     (void)ftp_close_pcb(&s->pasv_listen_pcb, 1);
+    s->data_connecting = 0;
 
     if (s->file_open) {
         lfs_file_close(s_lfs, &s->file);
@@ -528,19 +536,33 @@ static err_t ftp_data_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 {
     ftp_session_t *s = (ftp_session_t *)arg;
 
-    /* lwIP only invokes this callback on a successful connect; a non-OK err
-     * means the PCB has already been freed, so it must not be touched. */
-    if (err != ERR_OK || !s) {
-        if (s) {
-            s->data_pcb = NULL;
-            ftp_send_reply(s, "425 Can't open data connection.\r\n");
-            ftp_close_data(s);
-        }
+    /* The session may have moved on while the connect was in flight — closed
+     * by QUIT, the idle timer or an error, its slot possibly already handed to
+     * a different client, or the transfer cancelled by ABOR/PASV. Only a
+     * session still waiting on this connect may be touched; anything else gets
+     * the stray connection closed and nothing else. (lwIP reports a failed
+     * connect with the PCB already freed, so it may pass NULL here — then
+     * data_connecting is all there is to match on.) */
+    int mine = s && s->in_use && s->data_connecting &&
+               (pcb == NULL || s->data_pcb == pcb);
+    if (!mine) {
+        /* lwIP only invokes this callback on a successful connect; a non-OK
+         * err means the PCB has already been freed and must not be touched. */
+        if (err != ERR_OK || !pcb) return ERR_OK;
+        struct tcp_pcb *stale = pcb;
+        return ftp_close_pcb(&stale, 0) ? ERR_ABRT : ERR_OK;
+    }
+
+    s->data_connecting = 0;
+
+    if (err != ERR_OK) {
+        s->data_pcb = NULL; /* already freed by lwIP */
+        ftp_send_reply(s, "425 Can't open data connection.\r\n");
+        ftp_close_data(s);
         return ERR_OK;
     }
 
     s->data_aborted = 0;
-    s->data_pcb = pcb;
     ftp_start_transfer(s);
     return s->data_aborted ? ERR_ABRT : ERR_OK;
 }
@@ -580,7 +602,7 @@ static void ftp_start_transfer(ftp_session_t *s)
  */
 static void ftp_begin_transfer(ftp_session_t *s)
 {
-    if (s->data_pcb) {
+    if (s->data_pcb && !s->data_connecting) {
         /* Already connected (PASV client connected early). */
         ftp_start_transfer(s);
         return;
@@ -595,11 +617,18 @@ static void ftp_begin_transfer(ftp_session_t *s)
             tcp_recv(pcb, ftp_data_recv);
             tcp_sent(pcb, ftp_data_sent);
 
+            /* Publish the PCB *before* connecting: until the connect completes
+             * it is still ours to close, and a teardown in between must not
+             * leave lwIP holding callbacks into a recycled session. */
+            s->data_pcb        = pcb;
+            s->data_connecting = 1;
             if (tcp_connect(pcb, &s->port_addr, s->port_port,
                             ftp_data_connected) == ERR_OK) {
                 /* ftp_data_connected() will call ftp_start_transfer(). */
                 return;
             }
+            s->data_pcb        = NULL;
+            s->data_connecting = 0;
             tcp_abort(pcb);
         }
         ftp_send_reply(s, "425 Can't open data connection.\r\n");
@@ -657,16 +686,12 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return ERR_OK;
     }
     s->data_aborted = 0;
+    /* Data-channel progress keeps the session alive; see ftp_ctrl_poll(). */
+    s->idle_polls = 0;
 
     if (!p) {
         /* Client closed data connection — end of upload. */
-        if (s->data_mode == FTP_DATA_STOR && s->file_open) {
-            lfs_file_close(s_lfs, &s->file);
-            s->file_open = 0;
-        }
-        if (ftp_close_pcb(&s->data_pcb, 0)) s->data_aborted = 1;
-        s->stor_active = 0;
-        s->data_mode   = FTP_DATA_IDLE;
+        ftp_close_data(s);
         ftp_send_reply(s, "226 Transfer complete.\r\n");
         return s->data_aborted ? ERR_ABRT : ERR_OK;
     }
@@ -677,7 +702,9 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         for (q = p; q != NULL; q = q->next) {
             lfs_ssize_t w = lfs_file_write(s_lfs, &s->file,
                                            q->payload, q->len);
-            if (w < 0) {
+            /* A short write means the volume filled up mid-pbuf; accepting it
+             * would silently truncate the uploaded file. */
+            if (w != (lfs_ssize_t)q->len) {
                 tcp_recved(pcb, p->tot_len);
                 pbuf_free(p);
                 ftp_close_data(s);
@@ -699,6 +726,7 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
     (void)len;
     if (!s) return ERR_OK;
     s->data_aborted = 0;
+    s->idle_polls   = 0; /* transfer is making progress */
 
     /* Previous chunk ACK'd — send more data. */
     if (s->data_mode == FTP_DATA_RETR ||
@@ -866,7 +894,13 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     /* Build reply with the server's IP from the control connection. */
     ip_addr_t local_ip;
     u16_t local_port;
-    tcp_tcp_get_tcp_addrinfo(s->ctrl_pcb, 1, &local_ip, &local_port);
+    if (tcp_tcp_get_tcp_addrinfo(s->ctrl_pcb, 1, &local_ip, &local_port) != ERR_OK) {
+        /* local_ip is untouched on failure — advertising it would send the
+         * client at a garbage address. */
+        ftp_close_data(s);
+        ftp_send_reply(s, "421 Cannot determine server address.\r\n");
+        return;
+    }
 
     uint32_t ip4 = ip_addr_get_ip4_u32(&local_ip);
     uint8_t *ip  = (uint8_t *)&ip4;
@@ -1357,6 +1391,9 @@ static err_t ftp_ctrl_poll(void *arg, struct tcp_pcb *pcb)
     (void)pcb;
     if (!s) return ERR_OK;
 
+    /* Counts silence on *both* channels: ftp_ctrl_recv() and the data-channel
+     * callbacks reset it, so a long transfer survives while a genuinely stuck
+     * one still times out. */
     s->idle_polls++;
     if (s->idle_polls >= FTP_SERVER_IDLE_TIMEOUT_POLLS) {
         s->ctrl_aborted = 0;

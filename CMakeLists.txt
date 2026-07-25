@@ -110,4 +110,10 @@ if(FTP_SERVER_BUILD_TESTS)
 
     ftp_add_server_library(ftp_server_user_only FTP_SERVER_USER=\"tester\")
     ftp_add_test_executable(ftp_tests_user_only tests/test_auth.cpp ftp_server_user_only)
+
+    # Short path buffer — see tests/test_path_limits.cpp. Path overflow is
+    # unreachable while FTP_SERVER_PATH_MAX equals FTP_SERVER_CMD_BUF_SIZE.
+    ftp_add_server_library(ftp_server_short_path FTP_SERVER_PATH_MAX=64)
+    ftp_add_test_executable(ftp_tests_short_path tests/test_path_limits.cpp
+        ftp_server_short_path)
 endif()

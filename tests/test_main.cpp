@@ -1522,3 +1522,227 @@ TEST_CASE("closing a session releases an open file and directory", "[transfer]")
     REQUIRE(send_cmd(c2, "QUIT\r\n") == "221 Goodbye.\r\n");
     REQUIRE(s_dir_closes == 1);
 }
+
+/* ==================================================================== */
+/*  Regression: in-flight active-mode connects                          */
+/* ==================================================================== */
+
+namespace {
+
+/** tcp_connect hook that captures the PCB + callback instead of connecting. */
+tcp_connected_fn  g_pending_cb;
+struct tcp_pcb   *g_pending_pcb;
+
+err_t capture_connect(struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
+                      tcp_connected_fn connected)
+{
+    g_pending_pcb = pcb;
+    g_pending_cb  = connected;
+    return ERR_OK;
+}
+
+/** Arm PORT + RETR and leave the outgoing connect in flight. */
+void start_pending_connect(const Client &c)
+{
+    g_pending_cb  = nullptr;
+    g_pending_pcb = nullptr;
+    mock_tcp_connect_fn = capture_connect;
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+    REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty());
+    mock_tcp_connect_fn = nullptr;
+    REQUIRE(g_pending_cb != nullptr);
+    REQUIRE(g_pending_pcb != nullptr);
+}
+
+} // namespace
+
+TEST_CASE("a half-open active-mode PCB is reclaimed when the session closes",
+          "[transfer][port]")
+{
+    /* Given a session whose outgoing data connect is still in flight ... */
+    init_server();
+    Client c = connect_client();
+    start_pending_connect(c);
+
+    static struct tcp_pcb *s_watch;
+    static bool            s_watch_closed;
+    s_watch        = g_pending_pcb;
+    s_watch_closed = false;
+    mock_tcp_close_fn = [](struct tcp_pcb *pcb) -> err_t {
+        if (pcb == s_watch) s_watch_closed = true;
+        return ERR_OK;
+    };
+
+    /* When the client quits before the connect completes ... */
+    REQUIRE(send_cmd(c, "QUIT\r\n") == "221 Goodbye.\r\n");
+    mock_tcp_close_fn = nullptr;
+
+    /* Then the PCB was closed rather than leaked with callbacks still
+     * pointing into the (now recycled) session. */
+    REQUIRE(s_watch_closed);
+}
+
+TEST_CASE("a connect completing after teardown cannot hijack the session slot",
+          "[transfer][port]")
+{
+    /* Given a pending connect whose session is closed and its slot reused ... */
+    init_server();
+    Client c = connect_client();
+    start_pending_connect(c);
+
+    int   pending_idx = mock_tcp_pcb_index(g_pending_pcb);
+    void *stale_arg   = mock_tcp_cb_arg[pending_idx];
+    REQUIRE(stale_arg != nullptr);
+
+    REQUIRE(send_cmd(c, "QUIT\r\n") == "221 Goodbye.\r\n");
+    Client c2 = connect_client(); /* takes over the freed session slot */
+
+    /* When the stale connect finally reports success ... */
+    u16_t before = mock_tcp_write_len;
+    err_t rc = g_pending_cb(stale_arg, g_pending_pcb, ERR_OK);
+
+    /* Then it must be dropped silently: no 150/451 on the new client's
+     * control connection, and no transfer started on its behalf. */
+    REQUIRE(rc == ERR_OK);
+    REQUIRE(written_since(before).empty());
+    REQUIRE(send_cmd(c2, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
+    REQUIRE(send_cmd(c2, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("ABOR during a pending connect discards the late connection",
+          "[transfer][port]")
+{
+    init_server();
+    Client c = connect_client();
+    start_pending_connect(c);
+
+    REQUIRE(send_cmd(c, "ABOR\r\n") == "226 ABOR command successful.\r\n");
+
+    /* The cancelled connect must not resurrect the aborted transfer. */
+    u16_t before = mock_tcp_write_len;
+    REQUIRE(g_pending_cb(mock_tcp_cb_arg[c.idx], g_pending_pcb, ERR_OK) == ERR_OK);
+    REQUIRE(written_since(before).empty());
+}
+
+/* ==================================================================== */
+/*  Regression: idle timeout vs. active transfers                       */
+/* ==================================================================== */
+
+TEST_CASE("data-channel progress keeps a long transfer from timing out",
+          "[transfer][connect]")
+{
+    /* Given an upload whose control connection stays silent throughout ... */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    /* When it runs for well past the idle timeout, one segment per poll ... */
+    std::string chunk = "payload";
+    for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS * 2; i++) {
+        REQUIRE(mock_tcp_cb_poll[c.idx] != nullptr);
+        mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+        /* A timed-out session has had its callbacks detached — checking here
+         * pins the failure on the poll that killed the live transfer. */
+        REQUIRE(mock_tcp_cb_recv[data_idx] != nullptr);
+        struct pbuf p = make_pbuf(chunk);
+        mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, &p, ERR_OK);
+    }
+
+    /* Then the session is still alive and the upload can finish. */
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+    REQUIRE(send_cmd(c, "NOOP\r\n") == "200 NOOP ok.\r\n");
+}
+
+TEST_CASE("a stalled transfer still hits the idle timeout", "[transfer][connect]")
+{
+    /* The timeout must measure progress, not merely "a transfer is armed" —
+     * otherwise a client that opens a data connection and goes quiet pins a
+     * session slot forever. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    (void)accept_pasv_data_connection();
+
+    for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS; i++) {
+        mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    }
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+}
+
+TEST_CASE("an active-mode upload clears the PORT target when it completes",
+          "[transfer][port]")
+{
+    /* A finished STOR must reset the data channel exactly like every other
+     * transfer, or the next command silently reuses the stale PORT target. */
+    init_server();
+    Client c = connect_client();
+    start_pending_connect(c); /* PORT armed; RETR left pending */
+    REQUIRE(send_cmd(c, "ABOR\r\n") == "226 ABOR command successful.\r\n");
+
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+    mock_tcp_connect_fn = capture_connect;
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    mock_tcp_connect_fn = nullptr;
+
+    u16_t before = mock_tcp_write_len;
+    REQUIRE(g_pending_cb(mock_tcp_cb_arg[c.idx], g_pending_pcb, ERR_OK) == ERR_OK);
+    REQUIRE(written_since(before) == "150 Ok to send data.\r\n");
+
+    int data_idx = mock_tcp_pcb_index(g_pending_pcb);
+    before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], g_pending_pcb, nullptr, ERR_OK);
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+/* ==================================================================== */
+/*  Regression: misc. error paths                                       */
+/* ==================================================================== */
+
+TEST_CASE("a short filesystem write aborts the upload", "[transfer]")
+{
+    /* Accepting a partial write would silently truncate the stored file. */
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_write_fn = [](lfs_t *, lfs_file_t *, const void *,
+                                lfs_size_t size) -> lfs_ssize_t {
+        return (lfs_ssize_t)(size / 2); /* volume filled up mid-write */
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    std::string chunk = "payload";
+    struct pbuf p = make_pbuf(chunk);
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, &p, ERR_OK);
+    REQUIRE(written_since(before) == "452 Insufficient storage space.\r\n");
+}
+
+TEST_CASE("PASV fails cleanly when the local address is unavailable", "[pasv]")
+{
+    /* Without the check the 227 reply would advertise an uninitialised
+     * address and send the client's data connection nowhere. */
+    init_server();
+    Client c = connect_client();
+
+    mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *, int, ip_addr_t *,
+                                          u16_t *) -> err_t { return ERR_VAL; };
+    REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot determine server address.\r\n");
+    mock_tcp_tcp_get_tcp_addrinfo_fn = nullptr;
+
+    /* The half-built listener was torn down with it. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
