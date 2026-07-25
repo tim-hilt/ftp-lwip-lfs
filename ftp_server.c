@@ -461,7 +461,7 @@ static void ftp_start_transfer(ftp_session_t *s)
         ftp_send_reply(s, "150 Ok to send data.\r\n");
     } else if (s->data_mode == FTP_DATA_RETR) {
         char reply[FTP_SERVER_PATH_MAX + 64];
-        snprintf(reply, sizeof(reply),
+        (void)snprintf(reply, sizeof(reply),
                  "150 Opening %s mode data connection for %s (%ld bytes).\r\n",
                  (s->type == 'I') ? "BINARY" : "ASCII",
                  s->retr_name, (long)s->retr_size);
@@ -693,7 +693,7 @@ static void cmd_pwd(ftp_session_t *s, const char *arg)
 {
     (void)arg;
     char reply[FTP_SERVER_PATH_MAX + 64];
-    snprintf(reply, sizeof(reply), "257 \"%s\" is the current directory.\r\n",
+    (void)snprintf(reply, sizeof(reply), "257 \"%s\" is the current directory.\r\n",
              s->cwd);
     ftp_send_reply(s, reply);
 }
@@ -774,7 +774,7 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     uint8_t *ip  = (uint8_t *)&ip4;
 
     char reply[FTP_SERVER_PATH_MAX + 64];
-    snprintf(reply, sizeof(reply),
+    (void)snprintf(reply, sizeof(reply),
              "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u).\r\n",
              ip[0], ip[1], ip[2], ip[3],
              (unsigned)(port >> 8), (unsigned)(port & 0xff));
@@ -966,7 +966,7 @@ static void cmd_mkd(ftp_session_t *s, const char *arg)
         ftp_send_reply(s, "550 Create directory failed.\r\n");
     } else {
         char reply[FTP_SERVER_PATH_MAX + 64];
-        snprintf(reply, sizeof(reply),
+        (void)snprintf(reply, sizeof(reply),
                  "257 \"%s\" created.\r\n", path);
         ftp_send_reply(s, reply);
     }
@@ -1052,7 +1052,7 @@ static void cmd_size(ftp_session_t *s, const char *arg)
         return;
     }
     char reply[FTP_SERVER_PATH_MAX + 64];
-    snprintf(reply, sizeof(reply), "213 %lu\r\n",
+    (void)snprintf(reply, sizeof(reply), "213 %lu\r\n",
              (unsigned long)info.size);
     ftp_send_reply(s, reply);
 }
