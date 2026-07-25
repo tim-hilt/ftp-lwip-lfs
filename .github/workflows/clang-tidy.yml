@@ -14,11 +14,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install clang-tidy
-        run: sudo apt-get update && sudo apt-get install -y clang-tidy
-
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Build clang-tidy image
+        run: docker build -t ftp-lwip-lfs-clang-tidy .
 
       - name: Run clang-tidy (ftp_server.c/.h only)
-        run: clang-tidy -p build ftp_server.c
+        run: docker run --rm -v "${{ github.workspace }}":/repo ftp-lwip-lfs-clang-tidy

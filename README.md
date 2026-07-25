@@ -110,14 +110,22 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 
 `ftp_server.c`/`.h` are linted with [clang-tidy](https://clang.llvm.org/extra/clang-tidy/) (config: `.clang-tidy`); `lwip/` and `littlefs/` are vendored submodules and are excluded. Ruleset covers `bugprone-*`, `cert-*`, `clang-analyzer-*`, `misc-*`, `performance-*`, `portability-*`, `readability-*`, plus `cppcoreguidelines-no-malloc`/`hicpp-no-malloc` to enforce the no-heap-allocation guideline.
 
-Run it locally:
+Recommended — use the provided `Dockerfile`, which pins the exact toolchain (`ubuntu:24.04` + apt's `clang-tidy`) the CI workflow (`.github/workflows/clang-tidy.yml`) builds and runs, so results are deterministic and match CI exactly — no local clang-tidy version skew:
+
+```sh
+git submodule update --init --recursive   # once, if not already checked out
+docker build -t ftp-lwip-lfs-clang-tidy .
+docker run --rm -v "$PWD":/repo ftp-lwip-lfs-clang-tidy
+```
+
+Without Docker:
 
 ```sh
 cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 clang-tidy -p build ftp_server.c
 ```
 
-On macOS with Homebrew LLVM, pass the SDK sysroot explicitly (Apple Clang's driver does this automatically, but `clang-tidy` does not):
+On macOS with Homebrew LLVM, pass the SDK sysroot explicitly (Apple Clang's driver does this automatically, but `clang-tidy` does not); versions newer than CI's may also report findings CI does not (see `.github/workflows/clang-tidy.yml` for the pinned Ubuntu/apt version):
 
 ```sh
 clang-tidy -p build --extra-arg=-isysroot --extra-arg=$(xcrun --show-sdk-path) ftp_server.c
