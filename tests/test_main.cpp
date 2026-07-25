@@ -1,128 +1,17 @@
 /**
  * @file test_main.cpp
- * @brief Catch2 unit tests for the FTP server, driven against the mock
- *        lwIP + LittleFS backends.
+ * @brief Catch2 unit tests for the FTP server built without credentials
+ *        (FTP_SERVER_USER == NULL -> every client is logged in on accept).
  *
- * Test strategy
- * -------------
- * ftp_server.c only exposes ftp_server_init()/ftp_server_deinit() — all
- * protocol behaviour is exercised indirectly by driving the callbacks that
- * ftp_server.c registers with the mock lwIP layer (tcp_arg/tcp_recv/...),
- * exactly as real lwIP would invoke them:
- *
- *   1. ftp_server_init() registers ftp_ctrl_accept as the listener's
- *      accept callback -> captured in mock_tcp_cb_accept[0] (the listener
- *      is always the first PCB allocated after mock_lwip_reset()).
- *   2. Simulating an incoming client = allocate a PCB via tcp_new() and
- *      invoke that captured accept callback with it.
- *   3. Simulating a client sending a command = build a struct pbuf around
- *      the command text and invoke the captured recv callback.
- *   4. Everything ftp_server.c writes (control replies *and* data-channel
- *      bytes) lands in the single shared mock_tcp_write_buf, so tests
- *      capture mock_tcp_write_len before/after an action and inspect the
- *      slice that was appended.
- *
- * No dynamic allocation is used anywhere in this file, matching the
- * project's no-heap policy for the library itself (tests are host-side
- * only, but there's no need to allocate regardless).
+ * The credential paths are compile-time excluded from this build and are
+ * covered separately by tests/test_auth.cpp. See ftp_test_support.hpp for
+ * how the lwIP callbacks are driven.
  */
-#include <catch2/catch_test_macros.hpp>
+#include "ftp_test_support.hpp"
 
-#include <cstring>
-#include <string>
+#include <cstdio>
 
-extern "C" {
-#include "ftp_server.h"
-#include "mock_lwip.h"
-#include "mock_lfs.h"
-}
-
-namespace {
-
-/* The listener PCB is always the very first PCB tcp_new() hands out right
- * after mock_lwip_reset(), because ftp_server_init() is the first thing
- * every test does and it makes exactly one tcp_new() call. */
-constexpr int kListenIdx = 0;
-
-struct Client {
-    struct tcp_pcb *pcb;
-    int             idx;
-};
-
-/** Reset both mocks and bring up the server against mock_lfs. */
-void init_server()
-{
-    mock_lwip_reset();
-    mock_lfs_reset();
-    REQUIRE(ftp_server_init(&mock_lfs) == ERR_OK);
-}
-
-/** Simulate a new control connection arriving and return its handle. */
-Client connect_client()
-{
-    struct tcp_pcb *pcb = tcp_new();
-    REQUIRE(pcb != nullptr);
-    REQUIRE(mock_tcp_cb_accept[kListenIdx] != nullptr);
-    err_t err = mock_tcp_cb_accept[kListenIdx](mock_tcp_cb_arg[kListenIdx], pcb, ERR_OK);
-    REQUIRE(err == ERR_OK);
-    Client c;
-    c.pcb = pcb;
-    c.idx = mock_tcp_pcb_index(pcb);
-    REQUIRE(c.idx >= 0);
-    return c;
-}
-
-/** Build a single-segment pbuf around `data` (must outlive the call). */
-struct pbuf make_pbuf(const std::string &data)
-{
-    struct pbuf p{};
-    p.next    = nullptr;
-    p.payload = const_cast<char *>(data.data());
-    p.len     = static_cast<u16_t>(data.size());
-    p.tot_len = p.len;
-    p.ref     = 1;
-    return p;
-}
-
-/** Feed one command line to a client's control connection and return
- *  exactly the bytes ftp_server.c wrote out in response. */
-std::string send_cmd(const Client &c, const std::string &line)
-{
-    u16_t before = mock_tcp_write_len;
-    struct pbuf p = make_pbuf(line);
-    REQUIRE(mock_tcp_cb_recv[c.idx] != nullptr);
-    err_t err = mock_tcp_cb_recv[c.idx](mock_tcp_cb_arg[c.idx], c.pcb, &p, ERR_OK);
-    REQUIRE(err == ERR_OK);
-    return std::string(mock_tcp_write_buf + before,
-                        static_cast<size_t>(mock_tcp_write_len - before));
-}
-
-/** Everything written since `since`. */
-std::string written_since(u16_t since)
-{
-    return std::string(mock_tcp_write_buf + since,
-                        static_cast<size_t>(mock_tcp_write_len - since));
-}
-
-/**
- * Simulate a client connecting to the most recently opened PASV listener.
- * Relies on the invariant that nothing else calls tcp_new() between the
- * PASV command and this call, so the new data PCB's pool index is exactly
- * one past the listener's.
- */
-struct tcp_pcb *accept_pasv_data_connection()
-{
-    struct tcp_pcb *data_pcb = tcp_new();
-    REQUIRE(data_pcb != nullptr);
-    int data_idx = mock_tcp_pcb_index(data_pcb);
-    int pasv_idx = data_idx - 1;
-    REQUIRE(mock_tcp_cb_accept[pasv_idx] != nullptr);
-    err_t err = mock_tcp_cb_accept[pasv_idx](mock_tcp_cb_arg[pasv_idx], data_pcb, ERR_OK);
-    REQUIRE(err == ERR_OK);
-    return data_pcb;
-}
-
-} // namespace
+using namespace ftptest;
 
 /* ==================================================================== */
 /*  Server lifecycle                                                    */
@@ -157,6 +46,37 @@ TEST_CASE("ftp_server_init succeeds and registers the accept callback", "[init]"
 {
     init_server();
     REQUIRE(mock_tcp_cb_accept[kListenIdx] != nullptr);
+}
+
+TEST_CASE("ftp_server_init propagates a bind failure", "[init]")
+{
+    mock_lwip_reset();
+    mock_lfs_reset();
+    mock_tcp_bind_fn = [](struct tcp_pcb *, const ip_addr_t *, u16_t) -> err_t {
+        return ERR_USE;
+    };
+    REQUIRE(ftp_server_init(&mock_lfs) == ERR_USE);
+}
+
+TEST_CASE("ftp_server_init frees the bound PCB when listen fails", "[init]")
+{
+    mock_lwip_reset();
+    mock_lfs_reset();
+
+    static struct tcp_pcb *s_closed;
+    s_closed = nullptr;
+    mock_tcp_close_fn = [](struct tcp_pcb *pcb) -> err_t { s_closed = pcb; return ERR_OK; };
+    mock_tcp_listen_with_backlog_fn = [](struct tcp_pcb *, u8_t) -> struct tcp_pcb * {
+        return nullptr;
+    };
+
+    REQUIRE(ftp_server_init(&mock_lfs) == ERR_MEM);
+    /* tcp_listen() leaves the bound PCB allocated on failure — it must be
+     * closed, not leaked. */
+    REQUIRE(s_closed != nullptr);
+
+    mock_tcp_close_fn = nullptr;
+    mock_tcp_listen_with_backlog_fn = nullptr;
 }
 
 TEST_CASE("ftp_server_deinit closes sessions and is idempotent", "[init]")
@@ -212,6 +132,13 @@ TEST_CASE("beyond FTP_SERVER_MAX_CLIENTS the connection is aborted", "[connect]"
     REQUIRE(s_aborted_pcb == pcb);
 }
 
+TEST_CASE("the accept callback rejects a failed connection", "[connect]")
+{
+    init_server();
+    REQUIRE(mock_tcp_cb_accept[kListenIdx](mock_tcp_cb_arg[kListenIdx], nullptr, ERR_ABRT)
+            == ERR_VAL);
+}
+
 TEST_CASE("client disconnect via recv NULL tears down the session", "[connect]")
 {
     init_server();
@@ -227,6 +154,19 @@ TEST_CASE("client disconnect via recv NULL tears down the session", "[connect]")
     REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
 }
 
+TEST_CASE("a control recv on a detached PCB is a no-op", "[connect]")
+{
+    init_server();
+    Client c = connect_client();
+
+    /* lwIP can deliver one last segment after tcp_arg(pcb, NULL). */
+    std::string line = "NOOP\r\n";
+    struct pbuf p = make_pbuf(line);
+    u16_t before = mock_tcp_write_len;
+    REQUIRE(mock_tcp_cb_recv[c.idx](nullptr, c.pcb, &p, ERR_OK) == ERR_OK);
+    REQUIRE(mock_tcp_write_len == before);
+}
+
 TEST_CASE("control error callback cleans up the session", "[connect]")
 {
     init_server();
@@ -235,6 +175,8 @@ TEST_CASE("control error callback cleans up the session", "[connect]")
 
     /* lwIP calls the error callback (e.g. on RST) — PCB already freed. */
     mock_tcp_cb_err[c.idx](mock_tcp_cb_arg[c.idx], ERR_RST);
+    /* A detached error callback must be harmless too. */
+    mock_tcp_cb_err[c.idx](nullptr, ERR_RST);
 
     /* Session slot must be released so a new client can connect. */
     Client c2 = connect_client();
@@ -247,6 +189,9 @@ TEST_CASE("idle timeout closes the session after enough polls", "[connect]")
     Client c = connect_client();
     REQUIRE(mock_tcp_cb_poll[c.idx] != nullptr);
 
+    /* A detached poll callback must be harmless. */
+    REQUIRE(mock_tcp_cb_poll[c.idx](nullptr, c.pcb) == ERR_OK);
+
     /* Fire poll up to (but not including) the limit — session stays alive. */
     for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS - 1; i++) {
         err_t err = mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
@@ -258,6 +203,82 @@ TEST_CASE("idle timeout closes the session after enough polls", "[connect]")
     mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
     REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
     REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
+}
+
+TEST_CASE("receiving data resets the idle counter", "[connect]")
+{
+    init_server();
+    Client c = connect_client();
+
+    for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS - 1; i++) {
+        mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    }
+    REQUIRE(send_cmd(c, "NOOP\r\n") == "200 NOOP ok.\r\n");
+
+    /* The counter restarted, so one more poll must not close the session. */
+    mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    REQUIRE(mock_tcp_cb_recv[c.idx] != nullptr);
+}
+
+/* ==================================================================== */
+/*  lwIP callback contract: abort must surface as ERR_ABRT              */
+/* ==================================================================== */
+
+TEST_CASE("a close that degrades to abort returns ERR_ABRT to lwIP", "[lwip]")
+{
+    /* lwIP frees an aborted PCB immediately; a callback that keeps returning
+     * ERR_OK would leave lwIP dereferencing freed memory. */
+    init_server();
+    Client c = connect_client();
+
+    mock_tcp_close_fn = [](struct tcp_pcb *) -> err_t { return ERR_MEM; };
+    mock_tcp_abort_fn = [](struct tcp_pcb *) {};
+
+    SECTION("from the control recv callback (QUIT)") {
+        REQUIRE(send_cmd(c, "QUIT\r\n") == "221 Goodbye.\r\n");
+        REQUIRE(g_last_err == ERR_ABRT);
+    }
+    SECTION("from the control recv callback (client FIN)") {
+        struct pbuf *none = nullptr;
+        REQUIRE(mock_tcp_cb_recv[c.idx](mock_tcp_cb_arg[c.idx], c.pcb, none, ERR_OK)
+                == ERR_ABRT);
+    }
+    SECTION("from the idle poll callback") {
+        err_t err = ERR_OK;
+        for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS; i++) {
+            err = mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+        }
+        REQUIRE(err == ERR_ABRT);
+    }
+
+    mock_tcp_close_fn = nullptr;
+    mock_tcp_abort_fn = nullptr;
+}
+
+TEST_CASE("an undeliverable reply tears the session down", "[lwip]")
+{
+    init_server();
+    Client c = connect_client();
+
+    /* Send window smaller than the reply -> ftp_send_reply gives up. */
+    c.pcb->snd_buf = 4;
+    REQUIRE(send_cmd(c, "NOOP\r\n").empty());
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+    REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
+}
+
+TEST_CASE("a failing tcp_write on the control channel tears the session down", "[lwip]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_tcp_write_fn = [](struct tcp_pcb *, const void *, u16_t, u8_t) -> err_t {
+        return ERR_MEM;
+    };
+    REQUIRE(send_cmd(c, "NOOP\r\n").empty());
+    mock_tcp_write_fn = nullptr;
+
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
 }
 
 /* ==================================================================== */
@@ -284,13 +305,16 @@ TEST_CASE("informational commands reply with expected content", "[commands]")
         REQUIRE(send_cmd(c, "NOOP\r\n") == "200 NOOP ok.\r\n");
     }
     SECTION("OPTS UTF8 ON is accepted") {
-        REQUIRE(send_cmd(c, "OPTS UTF8 ON\r\n") == "200 UTF8 set to on.\r\n");
+        REQUIRE(send_cmd(c, "OPTS utf8 on\r\n") == "200 UTF8 set to on.\r\n");
     }
     SECTION("OPTS rejects unsupported options") {
-        REQUIRE(send_cmd(c, "OPTS BOGUS\r\n") == "501 Option not understood.\r\n");
+        REQUIRE(send_cmd(c, "OPTS MLST\r\n") == "501 Option not understood.\r\n");
+    }
+    SECTION("OPTS rejects a missing argument") {
+        REQUIRE(send_cmd(c, "OPTS\r\n") == "501 Option not understood.\r\n");
     }
     SECTION("unknown command returns 502") {
-        REQUIRE(send_cmd(c, "WOOP\r\n") == "502 Command not implemented.\r\n");
+        REQUIRE(send_cmd(c, "FROB\r\n") == "502 Command not implemented.\r\n");
     }
     SECTION("commands are case-insensitive") {
         REQUIRE(send_cmd(c, "syst\r\n") == "215 UNIX Type: L8\r\n");
@@ -321,10 +345,6 @@ TEST_CASE("QUIT replies and tears down the session", "[commands]")
     Client c = connect_client();
 
     REQUIRE(send_cmd(c, "QUIT\r\n") == "221 Goodbye.\r\n");
-
-    /* The session is torn down: ftp_close_session() deregisters every
-     * callback on the control PCB, proving no further processing can
-     * happen through it. */
     REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
     REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
 }
@@ -334,8 +354,10 @@ TEST_CASE("multiple commands in one TCP segment are all processed", "[commands]"
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "NOOP\r\nNOOP\r\n") ==
-            "200 NOOP ok.\r\n200 NOOP ok.\r\n");
+    std::string out = send_cmd(c, "SYST\r\nNOOP\r\nPWD\r\n");
+    REQUIRE(out == "215 UNIX Type: L8\r\n"
+                   "200 NOOP ok.\r\n"
+                   "257 \"/\" is the current directory.\r\n");
 }
 
 TEST_CASE("a command split across two TCP segments is reassembled", "[commands]")
@@ -343,13 +365,8 @@ TEST_CASE("a command split across two TCP segments is reassembled", "[commands]"
     init_server();
     Client c = connect_client();
 
-    /* First segment: partial command without line ending. */
-    std::string reply1 = send_cmd(c, "NOO");
-    REQUIRE(reply1.empty());
-
-    /* Second segment: completes the command. */
-    std::string reply2 = send_cmd(c, "P\r\n");
-    REQUIRE(reply2 == "200 NOOP ok.\r\n");
+    REQUIRE(send_cmd(c, "SY").empty()); /* partial — no reply yet */
+    REQUIRE(send_cmd(c, "ST\r\n") == "215 UNIX Type: L8\r\n");
 }
 
 TEST_CASE("an unterminated line exceeding the buffer is discarded", "[commands]")
@@ -357,27 +374,53 @@ TEST_CASE("an unterminated line exceeding the buffer is discarded", "[commands]"
     init_server();
     Client c = connect_client();
 
-    std::string huge(FTP_SERVER_CMD_BUF_SIZE + 32, 'x'); /* no CR/LF at all */
+    std::string huge(FTP_SERVER_CMD_BUF_SIZE + 32, 'A');
     REQUIRE(send_cmd(c, huge) == "500 Command line too long.\r\n");
 }
 
+TEST_CASE("the tail of an over-long line is not parsed as a command", "[commands]")
+{
+    init_server();
+    Client c = connect_client();
+
+    /* Overflow the buffer with the start of a bogus command. */
+    std::string huge(FTP_SERVER_CMD_BUF_SIZE + 32, 'A');
+    REQUIRE(send_cmd(c, huge) == "500 Command line too long.\r\n");
+
+    /* More of the same line arrives, still without a terminator: silently
+     * discarded, not answered with a second 500. */
+    REQUIRE(send_cmd(c, std::string(64, 'A')).empty());
+
+    /* The line finally ends. Everything up to the '\n' belongs to the
+     * discarded command, so only the NOOP that follows is executed. */
+    REQUIRE(send_cmd(c, "SYST\r\nNOOP\r\n") == "200 NOOP ok.\r\n");
+}
+
 /* ==================================================================== */
-/*  USER / PASS (server configured with no auth requirement)            */
+/*  Authentication when no credentials are configured                   */
+/*  (the configured-credentials flow lives in test_auth.cpp)            */
 /* ==================================================================== */
 
 TEST_CASE("USER logs in immediately when no auth is configured", "[auth]")
 {
     init_server();
     Client c = connect_client();
-    REQUIRE(send_cmd(c, "USER anybody\r\n") == "230 Login successful.\r\n");
+
+    REQUIRE(send_cmd(c, "USER anyone\r\n") == "230 Login successful.\r\n");
+    /* Even a bare USER succeeds — the name is not consulted at all. */
+    REQUIRE(send_cmd(c, "USER\r\n") == "230 Login successful.\r\n");
+    REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
 }
 
 TEST_CASE("PASS without USER first is rejected", "[auth]")
 {
     init_server();
     Client c = connect_client();
-    /* Already logged in via accept (no auth configured), so PASS is not
+
+    /* Without credentials the client is already logged in, so no PASS is
      * awaited -> 503. */
+    REQUIRE(send_cmd(c, "PASS whatever\r\n") == "503 Login with USER first.\r\n");
+    REQUIRE(send_cmd(c, "USER anyone\r\n") == "230 Login successful.\r\n");
     REQUIRE(send_cmd(c, "PASS whatever\r\n") == "503 Login with USER first.\r\n");
 }
 
@@ -397,10 +440,7 @@ TEST_CASE("CWD into a directory updates PWD", "[fs]")
     init_server();
     Client c = connect_client();
 
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
-        return 0;
-    };
+    mock_lfs_stat_fn = stat_is_dir;
 
     REQUIRE(send_cmd(c, "CWD sub\r\n") == "250 Directory successfully changed.\r\n");
     REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/sub\" is the current directory.\r\n");
@@ -409,14 +449,25 @@ TEST_CASE("CWD into a directory updates PWD", "[fs]")
     REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
 }
 
+TEST_CASE("CWD accepts an absolute path", "[fs]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_stat_fn = stat_is_dir;
+
+    REQUIRE(send_cmd(c, "CWD deep/nest\r\n") == "250 Directory successfully changed.\r\n");
+    /* An absolute argument replaces the CWD rather than extending it. */
+    REQUIRE(send_cmd(c, "CWD /other\r\n") == "250 Directory successfully changed.\r\n");
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/other\" is the current directory.\r\n");
+}
+
 TEST_CASE("CWD to a non-directory or missing path fails", "[fs]")
 {
     init_server();
     Client c = connect_client();
 
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *) -> int {
-        return -1; /* ENOENT */
-    };
+    mock_lfs_stat_fn = stat_missing;
     REQUIRE(send_cmd(c, "CWD missing\r\n") == "550 Failed to change directory.\r\n");
     /* cwd is unchanged. */
     mock_lfs_stat_fn = nullptr;
@@ -428,13 +479,19 @@ TEST_CASE("relative path resolution collapses . and ..", "[fs]")
     init_server();
     Client c = connect_client();
 
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
-        return 0;
-    };
+    mock_lfs_stat_fn = stat_is_dir;
 
     REQUIRE(send_cmd(c, "CWD a/./b/../c\r\n") == "250 Directory successfully changed.\r\n");
     REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/a/c\" is the current directory.\r\n");
+}
+
+TEST_CASE("CDUP at the root stays at the root", "[fs]")
+{
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "CDUP\r\n") == "250 Directory successfully changed.\r\n");
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
 }
 
 TEST_CASE("a resolved path that overflows FTP_SERVER_PATH_MAX is rejected", "[fs]")
@@ -442,10 +499,7 @@ TEST_CASE("a resolved path that overflows FTP_SERVER_PATH_MAX is rejected", "[fs
     init_server();
     Client c = connect_client();
 
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
-        return 0;
-    };
+    mock_lfs_stat_fn = stat_is_dir;
 
     /* Build a cwd close to FTP_SERVER_PATH_MAX in one hop (must itself fit
      * within FTP_SERVER_CMD_BUF_SIZE as a command line). */
@@ -463,6 +517,37 @@ TEST_CASE("a resolved path that overflows FTP_SERVER_PATH_MAX is rejected", "[fs
     REQUIRE(pwd.rfind("257 \"/" + long_name + "\"", 0) == 0);
 }
 
+TEST_CASE("every path-taking command rejects an over-long path", "[fs]")
+{
+    /* One shared guard, so a new command that forgets the check is caught. */
+    const char *commands[] = {
+        "CWD", "DELE", "MKD", "RMD", "RNFR", "SIZE", "RETR", "STOR",
+        "LIST", "NLST",
+    };
+
+    for (const char *cmd : commands) {
+        init_server();
+        Client c = connect_client();
+        mock_lfs_stat_fn = stat_is_dir;
+
+        std::string long_name(FTP_SERVER_CMD_BUF_SIZE - 4 - 2 - 1, 'x');
+        REQUIRE(send_cmd(c, "CWD " + long_name + "\r\n") ==
+                "250 Directory successfully changed.\r\n");
+
+        INFO("command: " << cmd);
+        REQUIRE(send_cmd(c, std::string(cmd) + " short\r\n") == "550 Path too long.\r\n");
+    }
+
+    /* RNTO resolves its path before consulting the pending RNFR. */
+    init_server();
+    Client c = connect_client();
+    mock_lfs_stat_fn = stat_is_dir;
+    std::string long_name(FTP_SERVER_CMD_BUF_SIZE - 4 - 2 - 1, 'x');
+    REQUIRE(send_cmd(c, "CWD " + long_name + "\r\n") ==
+            "250 Directory successfully changed.\r\n");
+    REQUIRE(send_cmd(c, "RNTO short\r\n") == "550 Path too long.\r\n");
+}
+
 /* ==================================================================== */
 /*  X-aliases (XPWD, XCWD, XCUP, XMKD, XRMD)                          */
 /* ==================================================================== */
@@ -472,10 +557,7 @@ TEST_CASE("X-aliases map to their standard counterparts", "[commands]")
     init_server();
     Client c = connect_client();
 
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
-        return 0;
-    };
+    mock_lfs_stat_fn = stat_is_dir;
 
     SECTION("XPWD behaves like PWD") {
         REQUIRE(send_cmd(c, "XPWD\r\n") == "257 \"/\" is the current directory.\r\n");
@@ -522,6 +604,7 @@ TEST_CASE("RMD removes a directory or reports failure", "[fs]")
 {
     init_server();
     Client c = connect_client();
+    mock_lfs_stat_fn = stat_is_dir;
 
     SECTION("removes directory successfully") {
         REQUIRE(send_cmd(c, "RMD olddir\r\n") == "250 Remove directory successful.\r\n");
@@ -529,6 +612,17 @@ TEST_CASE("RMD removes a directory or reports failure", "[fs]")
     SECTION("reports failure when remove fails") {
         mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { return -1; };
         REQUIRE(send_cmd(c, "RMD olddir\r\n") == "550 Remove directory failed.\r\n");
+    }
+    SECTION("refuses to remove a regular file") {
+        mock_lfs_stat_fn = stat_is_reg;
+        REQUIRE(send_cmd(c, "RMD notadir\r\n") == "550 Remove directory failed.\r\n");
+    }
+    SECTION("reports failure for a missing path") {
+        mock_lfs_stat_fn = stat_missing;
+        REQUIRE(send_cmd(c, "RMD gone\r\n") == "550 Remove directory failed.\r\n");
+    }
+    SECTION("rejects missing argument") {
+        REQUIRE(send_cmd(c, "RMD\r\n") == "501 Specify directory name.\r\n");
     }
 }
 
@@ -544,6 +638,13 @@ TEST_CASE("DELE deletes a file or reports failure", "[fs]")
         mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { return -1; };
         REQUIRE(send_cmd(c, "DELE file.txt\r\n") == "550 Delete operation failed.\r\n");
     }
+    SECTION("refuses to delete a directory") {
+        mock_lfs_stat_fn = stat_is_dir;
+        REQUIRE(send_cmd(c, "DELE adir\r\n") == "550 Delete operation failed.\r\n");
+    }
+    SECTION("rejects missing argument") {
+        REQUIRE(send_cmd(c, "DELE\r\n") == "501 Specify file name.\r\n");
+    }
 }
 
 TEST_CASE("RNFR / RNTO rename flow", "[fs]")
@@ -556,7 +657,7 @@ TEST_CASE("RNFR / RNTO rename flow", "[fs]")
     }
 
     SECTION("RNFR on a missing file fails") {
-        mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *) -> int { return -1; };
+        mock_lfs_stat_fn = stat_missing;
         REQUIRE(send_cmd(c, "RNFR missing.txt\r\n") == "550 File not found.\r\n");
     }
 
@@ -569,6 +670,20 @@ TEST_CASE("RNFR / RNTO rename flow", "[fs]")
         REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
         mock_lfs_rename_fn = [](lfs_t *, const char *, const char *) -> int { return -1; };
         REQUIRE(send_cmd(c, "RNTO b.txt\r\n") == "550 Rename failed.\r\n");
+    }
+
+    SECTION("an intervening command cancels the pending rename") {
+        /* RFC 959: RNTO must directly follow RNFR. */
+        REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
+        REQUIRE(send_cmd(c, "NOOP\r\n") == "200 NOOP ok.\r\n");
+        REQUIRE(send_cmd(c, "RNTO b.txt\r\n") == "503 RNFR required first.\r\n");
+    }
+
+    SECTION("RNFR rejects a missing argument") {
+        REQUIRE(send_cmd(c, "RNFR\r\n") == "501 Specify file name.\r\n");
+    }
+    SECTION("RNTO rejects a missing argument") {
+        REQUIRE(send_cmd(c, "RNTO\r\n") == "501 Specify file name.\r\n");
     }
 }
 
@@ -585,11 +700,11 @@ TEST_CASE("SIZE reports file size or rejects non-files", "[fs]")
         REQUIRE(send_cmd(c, "SIZE file.bin\r\n") == "213 12345\r\n");
     }
     SECTION("rejects directories") {
-        mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-            if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
-            return 0;
-        };
+        mock_lfs_stat_fn = stat_is_dir;
         REQUIRE(send_cmd(c, "SIZE adir\r\n") == "550 Could not get file size.\r\n");
+    }
+    SECTION("rejects missing argument") {
+        REQUIRE(send_cmd(c, "SIZE\r\n") == "501 Specify file name.\r\n");
     }
 }
 
@@ -619,11 +734,81 @@ TEST_CASE("PASV reports the listener's port, incrementing across calls", "[pasv]
     REQUIRE(r2 == expect2);
 }
 
+TEST_CASE("the PASV port allocator wraps back to the first port", "[pasv]")
+{
+    init_server();
+    Client c = connect_client();
+
+    constexpr int kRange = FTP_SERVER_PASV_PORT_MAX - FTP_SERVER_PASV_PORT_MIN + 1;
+    for (int i = 0; i < kRange; i++) {
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    }
+
+    char expect[64];
+    std::snprintf(expect, sizeof(expect),
+                  "227 Entering Passive Mode (192,168,1,1,%u,%u).\r\n",
+                  (unsigned)(FTP_SERVER_PASV_PORT_MIN >> 8),
+                  (unsigned)(FTP_SERVER_PASV_PORT_MIN & 0xff));
+    REQUIRE(send_cmd(c, "PASV\r\n") == expect);
+}
+
+TEST_CASE("PASV reports socket setup failures", "[pasv]")
+{
+    init_server();
+    Client c = connect_client();
+
+    SECTION("no PCB available") {
+        mock_tcp_new_fn = []() -> struct tcp_pcb * { return nullptr; };
+        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot create data socket.\r\n");
+        mock_tcp_new_fn = nullptr;
+    }
+
+    SECTION("every port in the range is in use") {
+        static int s_binds;
+        s_binds = 0;
+        mock_tcp_bind_fn = [](struct tcp_pcb *, const ip_addr_t *, u16_t) -> err_t {
+            s_binds++;
+            return ERR_USE;
+        };
+        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot bind data socket.\r\n");
+        mock_tcp_bind_fn = nullptr;
+        /* Every port in the configured range must have been tried. */
+        REQUIRE(s_binds == FTP_SERVER_PASV_PORT_MAX - FTP_SERVER_PASV_PORT_MIN + 1);
+    }
+
+    SECTION("listen fails and the bound PCB is freed") {
+        static struct tcp_pcb *s_closed;
+        s_closed = nullptr;
+        mock_tcp_close_fn = [](struct tcp_pcb *pcb) -> err_t { s_closed = pcb; return ERR_OK; };
+        mock_tcp_listen_with_backlog_fn = [](struct tcp_pcb *, u8_t) -> struct tcp_pcb * {
+            return nullptr;
+        };
+        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot listen on data socket.\r\n");
+        REQUIRE(s_closed != nullptr);
+        mock_tcp_close_fn = nullptr;
+        mock_tcp_listen_with_backlog_fn = nullptr;
+    }
+}
+
 TEST_CASE("PORT parses a valid h1,h2,h3,h4,p1,p2 argument", "[port]")
 {
     init_server();
     Client c = connect_client();
-    REQUIRE(send_cmd(c, "PORT 10,0,0,1,4,1\r\n") == "200 PORT command successful.\r\n");
+    /* The mock reports 192.168.1.1 as the control connection's peer. */
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,1\r\n") == "200 PORT command successful.\r\n");
+}
+
+TEST_CASE("PORT refuses an address other than the client's", "[port][security]")
+{
+    /* RFC 2577: allowing an arbitrary address turns the server into an
+     * "FTP bounce" proxy for scanning or relaying to third-party hosts. */
+    init_server();
+    Client c = connect_client();
+    REQUIRE(send_cmd(c, "PORT 10,0,0,7,4,1\r\n") ==
+            "501 PORT address must match the control connection.\r\n");
+
+    /* And no data channel was armed by the rejected command. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
 TEST_CASE("PORT rejects malformed arguments", "[port]")
@@ -640,6 +825,9 @@ TEST_CASE("PORT rejects malformed arguments", "[port]")
     SECTION("octet value out of range") {
         REQUIRE(send_cmd(c, "PORT 300,0,0,1,4,1\r\n") == "501 Syntax error in parameters.\r\n");
     }
+    SECTION("trailing garbage after the last field") {
+        REQUIRE(send_cmd(c, "PORT 10,0,0,1,4,1x\r\n") == "501 Syntax error in parameters.\r\n");
+    }
     SECTION("missing argument") {
         REQUIRE(send_cmd(c, "PORT\r\n") == "501 Syntax error in parameters.\r\n");
     }
@@ -650,36 +838,45 @@ TEST_CASE("LIST/RETR before PASV or PORT fails", "[transfer]")
     init_server();
     Client c = connect_client();
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+    /* The aborted LIST must not leave the directory handle open. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
 /* ==================================================================== */
 /*  LIST / NLST                                                         */
 /* ==================================================================== */
 
+namespace {
+
+/** lfs_dir_read hook yielding ".", "..", "foo.txt" (42 B), "sub" (dir). */
+int dir_read_two_entries(lfs_t *, lfs_dir_t *, struct lfs_info *info)
+{
+    static const struct { const char *name; uint8_t type; uint32_t size; } kEntries[] = {
+        {".",       LFS_TYPE_DIR, 0},
+        {"..",      LFS_TYPE_DIR, 0},
+        {"foo.txt", LFS_TYPE_REG, 42},
+        {"sub",     LFS_TYPE_DIR, 0},
+    };
+    static size_t call = 0;
+    if (info == nullptr) { call = 0; return 0; } /* reset hook */
+    if (call >= sizeof(kEntries) / sizeof(kEntries[0])) return 0;
+    std::memset(info, 0, sizeof(*info));
+    info->type = kEntries[call].type;
+    info->size = kEntries[call].size;
+    std::strcpy(info->name, kEntries[call].name);
+    call++;
+    return 1;
+}
+
+} // namespace
+
 TEST_CASE("LIST streams directory entries in Unix format", "[transfer]")
 {
     init_server();
     Client c = connect_client();
 
-    static int call = 0;
-    call = 0;
-    mock_lfs_dir_read_fn = [](lfs_t *, lfs_dir_t *, struct lfs_info *info) -> int {
-        if (call == 0) {
-            info->type = LFS_TYPE_REG;
-            info->size = 42;
-            std::strcpy(info->name, "foo.txt");
-            call++;
-            return 1;
-        }
-        if (call == 1) {
-            info->type = LFS_TYPE_DIR;
-            info->size = 0;
-            std::strcpy(info->name, "sub");
-            call++;
-            return 1;
-        }
-        return 0;
-    };
+    dir_read_two_entries(nullptr, nullptr, nullptr); /* reset */
+    mock_lfs_dir_read_fn = dir_read_two_entries;
 
     REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
     REQUIRE(send_cmd(c, "LIST\r\n").empty()); /* async: waits for data conn */
@@ -694,7 +891,35 @@ TEST_CASE("LIST streams directory entries in Unix format", "[transfer]")
     REQUIRE(out.find("-rw-r--r-- 1 ftp ftp         42 Jan 01  2000 foo.txt\r\n") != std::string::npos);
     REQUIRE(out.find("drwxr-xr-x 1 ftp ftp          0 Jan 01  2000 sub\r\n") != std::string::npos);
 
+    /* "." and ".." are filtered out of the listing. */
+    REQUIRE(out.find(" .\r\n") == std::string::npos);
+    REQUIRE(out.find(" ..\r\n") == std::string::npos);
+
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+}
+
+TEST_CASE("LIST strips ls-style option arguments", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    static std::string s_opened;
+    s_opened.clear();
+    mock_lfs_dir_open_fn = [](lfs_t *, lfs_dir_t *, const char *path) -> int {
+        s_opened = path;
+        return 0;
+    };
+
+    SECTION("a bare option lists the current directory") {
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "LIST -la\r\n").empty());
+        REQUIRE(s_opened == "/");
+    }
+    SECTION("an option followed by a path lists that path") {
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "LIST -la sub\r\n").empty());
+        REQUIRE(s_opened == "/sub");
+    }
 }
 
 TEST_CASE("LIST fails when directory cannot be opened", "[transfer]")
@@ -708,23 +933,34 @@ TEST_CASE("LIST fails when directory cannot be opened", "[transfer]")
     REQUIRE(send_cmd(c, "LIST\r\n") == "550 Failed to open directory.\r\n");
 }
 
+TEST_CASE("a directory read error aborts the listing with 451", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_dir_read_fn = [](lfs_t *, lfs_dir_t *, struct lfs_info *) -> int {
+        return -1; /* e.g. LFS_ERR_CORRUPT */
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "LIST\r\n").empty());
+
+    u16_t before = mock_tcp_write_len;
+    accept_pasv_data_connection();
+    std::string out = written_since(before);
+
+    /* A read error must not be reported to the client as success. */
+    REQUIRE(out.find("226 Transfer complete.") == std::string::npos);
+    REQUIRE(out.find("451 Requested action aborted") != std::string::npos);
+}
+
 TEST_CASE("NLST lists only bare filenames", "[transfer]")
 {
     init_server();
     Client c = connect_client();
 
-    static int call = 0;
-    call = 0;
-    mock_lfs_dir_read_fn = [](lfs_t *, lfs_dir_t *, struct lfs_info *info) -> int {
-        if (call == 0) {
-            info->type = LFS_TYPE_REG;
-            info->size = 99;
-            std::strcpy(info->name, "one.txt");
-            call++;
-            return 1;
-        }
-        return 0;
-    };
+    dir_read_two_entries(nullptr, nullptr, nullptr); /* reset */
+    mock_lfs_dir_read_fn = dir_read_two_entries;
 
     REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
     REQUIRE(send_cmd(c, "NLST\r\n").empty());
@@ -742,12 +978,61 @@ TEST_CASE("NLST lists only bare filenames", "[transfer]")
     std::string data_payload = out.substr(data_start, data_end - data_start);
 
     /* NLST must emit only "name\r\n" — no permission string, no size. */
-    REQUIRE(data_payload == "one.txt\r\n");
+    REQUIRE(data_payload == "foo.txt\r\nsub\r\n");
+}
+
+TEST_CASE("a listing entry longer than the data buffer is truncated cleanly",
+          "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_dir_read_fn = [](lfs_t *, lfs_dir_t *, struct lfs_info *info) -> int {
+        static int call = 0;
+        if (info == nullptr) { call = 0; return 0; }
+        if (call++ > 0) return 0;
+        std::memset(info, 0, sizeof(*info));
+        info->type = LFS_TYPE_REG;
+        info->size = 1;
+        std::memset(info->name, 'n', sizeof(info->name) - 1);
+        info->name[sizeof(info->name) - 1] = '\0';
+        return 1;
+    };
+    mock_lfs_dir_read_fn(nullptr, nullptr, nullptr); /* reset */
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "NLST\r\n").empty());
+
+    u16_t before = mock_tcp_write_len;
+    accept_pasv_data_connection();
+    std::string out = written_since(before);
+
+    /* snprintf reserves the last buffer slot for its NUL; sending that slot
+     * would put a stray NUL byte on the wire. */
+    REQUIRE(out.find('\0') == std::string::npos);
 }
 
 /* ==================================================================== */
 /*  RETR                                                                 */
 /* ==================================================================== */
+
+namespace {
+
+/** lfs_file_read hook yielding `text` once, then EOF. */
+const char *g_retr_text = "";
+lfs_ssize_t read_once(lfs_t *, lfs_file_t *, void *buffer, lfs_size_t size)
+{
+    static bool done = false;
+    if (buffer == nullptr) { done = false; return 0; } /* reset hook */
+    if (done) return 0;
+    done = true;
+    lfs_size_t n = (lfs_size_t)std::strlen(g_retr_text);
+    if (n > size) n = size;
+    std::memcpy(buffer, g_retr_text, n);
+    return (lfs_ssize_t)n;
+}
+
+} // namespace
 
 TEST_CASE("RETR sends file content over the data connection", "[transfer]")
 {
@@ -755,18 +1040,9 @@ TEST_CASE("RETR sends file content over the data connection", "[transfer]")
     Client c = connect_client();
 
     mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
-
-    static int call = 0;
-    call = 0;
-    mock_lfs_file_read_fn = [](lfs_t *, lfs_file_t *, void *buffer, lfs_size_t) -> lfs_ssize_t {
-        if (call == 0) {
-            const char *data = "hello world";
-            std::memcpy(buffer, data, std::strlen(data));
-            call++;
-            return (lfs_ssize_t)std::strlen(data);
-        }
-        return 0;
-    };
+    g_retr_text = "hello world";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
 
     REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
     REQUIRE(send_cmd(c, "RETR file.txt\r\n").empty());
@@ -775,9 +1051,135 @@ TEST_CASE("RETR sends file content over the data connection", "[transfer]")
     accept_pasv_data_connection();
     std::string out = written_since(before);
 
-    REQUIRE(out.rfind("150 Opening ASCII mode data connection for file.txt (11 bytes).\r\n", 0) == 0);
+    /* Only binary transfers are implemented, so a session defaults to 'I'. */
+    REQUIRE(out.rfind("150 Opening BINARY mode data connection for file.txt (11 bytes).\r\n", 0) == 0);
     REQUIRE(out.find("hello world") != std::string::npos);
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+}
+
+TEST_CASE("RETR resumes when the send window fills up", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
+    g_retr_text = "hello world";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR file.txt\r\n").empty());
+
+    /* Data socket accepts only 5 of the 11 bytes before blocking. */
+    mock_tcp_track_sndbuf = 1;
+    u16_t before = mock_tcp_write_len;
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection(/*snd_buf=*/5);
+    std::string first = written_since(before);
+
+    REQUIRE(first.find("hello") != std::string::npos);
+    REQUIRE(first.find(" world") == std::string::npos);
+    REQUIRE(first.find("226 Transfer complete.\r\n") == std::string::npos);
+
+    /* The peer ACKs; lwIP invokes the sent callback and the rest goes out. */
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+    REQUIRE(mock_tcp_cb_sent[data_idx] != nullptr);
+    mock_tcp_ack(data_pcb, 64);
+
+    before = mock_tcp_write_len;
+    err_t err = mock_tcp_cb_sent[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, 5);
+    std::string rest = written_since(before);
+    mock_tcp_track_sndbuf = 0;
+
+    REQUIRE(err == ERR_OK);
+    REQUIRE(rest.rfind(" world", 0) == 0);
+    REQUIRE(rest.find("226 Transfer complete.\r\n") != std::string::npos);
+}
+
+TEST_CASE("a detached data sent callback is a no-op", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    u16_t before = mock_tcp_write_len;
+    REQUIRE(mock_tcp_cb_sent[data_idx](nullptr, data_pcb, 0) == ERR_OK);
+    /* STOR is an upload — the sent callback has nothing to push either. */
+    REQUIRE(mock_tcp_cb_sent[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, 0) == ERR_OK);
+    REQUIRE(mock_tcp_write_len == before);
+}
+
+TEST_CASE("a data connection reset aborts the transfer with 426", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    /* An upload stays open across callbacks, so the data PCB is still live
+     * when the peer resets the connection. */
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+    REQUIRE(mock_tcp_cb_err[data_idx] != nullptr);
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_err[data_idx](mock_tcp_cb_arg[data_idx], ERR_RST);
+    /* A detached error callback must be harmless. */
+    mock_tcp_cb_err[data_idx](nullptr, ERR_RST);
+    std::string out = written_since(before);
+
+    /* Without a 426 the client waits forever for a 226 that never comes. */
+    REQUIRE(out == "426 Connection closed; transfer aborted.\r\n");
+
+    /* The reset must not leave the session unable to transfer again. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("a data connection accepted before the command still transfers", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 5; };
+    g_retr_text = "abcde";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+
+    /* Client races ahead and connects before issuing RETR. */
+    accept_pasv_data_connection();
+
+    std::string out = send_cmd(c, "RETR file.bin\r\n");
+    REQUIRE(out.rfind("150 Opening BINARY", 0) == 0);
+    REQUIRE(out.find("abcde") != std::string::npos);
+    REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+}
+
+TEST_CASE("the data accept callback rejects a failed connection", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+
+    struct tcp_pcb *pcb = tcp_new();
+    int pasv_idx = mock_tcp_pcb_index(pcb) - 1;
+
+    static struct tcp_pcb *s_aborted;
+    s_aborted = nullptr;
+    mock_tcp_abort_fn = [](struct tcp_pcb *p) { s_aborted = p; };
+
+    REQUIRE(mock_tcp_cb_accept[pasv_idx](mock_tcp_cb_arg[pasv_idx], pcb, ERR_ABRT)
+            == ERR_ABRT);
+    REQUIRE(s_aborted == pcb);
+
+    REQUIRE(mock_tcp_cb_accept[pasv_idx](mock_tcp_cb_arg[pasv_idx], nullptr, ERR_ABRT)
+            == ERR_VAL);
+    mock_tcp_abort_fn = nullptr;
 }
 
 TEST_CASE("RETR fails when the file cannot be opened", "[transfer]")
@@ -790,11 +1192,70 @@ TEST_CASE("RETR fails when the file cannot be opened", "[transfer]")
     REQUIRE(send_cmd(c, "RETR missing.txt\r\n") == "550 Failed to open file.\r\n");
 }
 
+TEST_CASE("a file read error aborts the transfer with 451", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 512; };
+    mock_lfs_file_read_fn = [](lfs_t *, lfs_file_t *, void *, lfs_size_t) -> lfs_ssize_t {
+        return -1; /* e.g. LFS_ERR_CORRUPT */
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty());
+
+    u16_t before = mock_tcp_write_len;
+    accept_pasv_data_connection();
+    std::string out = written_since(before);
+
+    /* Reporting 226 here would leave the client with a silently short file. */
+    REQUIRE(out.find("226 Transfer complete.") == std::string::npos);
+    REQUIRE(out.find("451 Requested action aborted") != std::string::npos);
+}
+
 TEST_CASE("RETR without an argument is rejected", "[transfer]")
 {
     init_server();
     Client c = connect_client();
     REQUIRE(send_cmd(c, "RETR\r\n") == "501 Specify file name.\r\n");
+}
+
+TEST_CASE("a second transfer command while one is pending is refused", "[transfer]")
+{
+    /* Re-opening s->file / s->dir without closing corrupts littlefs's
+     * intrusive list of open handles, so the second command must be
+     * rejected outright rather than silently overwriting the handle. */
+    init_server();
+    Client c = connect_client();
+
+    static int s_opens;
+    s_opens = 0;
+    mock_lfs_file_opencfg_fn = [](lfs_t *, lfs_file_t *, const char *, int,
+                                  const struct lfs_file_config *) -> int {
+        s_opens++;
+        return 0;
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR a.txt\r\n").empty()); /* awaiting data conn */
+
+    SECTION("a second RETR") {
+        REQUIRE(send_cmd(c, "RETR b.txt\r\n") == "450 Transfer already in progress.\r\n");
+    }
+    SECTION("a STOR") {
+        REQUIRE(send_cmd(c, "STOR b.txt\r\n") == "450 Transfer already in progress.\r\n");
+    }
+    SECTION("a LIST") {
+        REQUIRE(send_cmd(c, "LIST\r\n") == "450 Transfer already in progress.\r\n");
+    }
+    REQUIRE(s_opens == 1);
+
+    /* PASV and ABOR both reset the state, so the client is never stuck. */
+    REQUIRE(send_cmd(c, "ABOR\r\n") == "226 ABOR command successful.\r\n");
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR b.txt\r\n").empty());
+    REQUIRE(s_opens == 2);
 }
 
 TEST_CASE("RETR over an active-mode PORT connection", "[transfer]")
@@ -803,16 +1264,9 @@ TEST_CASE("RETR over an active-mode PORT connection", "[transfer]")
     Client c = connect_client();
 
     mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 5; };
-    static int call = 0;
-    call = 0;
-    mock_lfs_file_read_fn = [](lfs_t *, lfs_file_t *, void *buffer, lfs_size_t) -> lfs_ssize_t {
-        if (call == 0) {
-            std::memcpy(buffer, "abcde", 5);
-            call++;
-            return 5;
-        }
-        return 0;
-    };
+    g_retr_text = "abcde";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
 
     static struct tcp_pcb  *s_connect_pcb;
     static tcp_connected_fn s_connect_cb;
@@ -828,7 +1282,7 @@ TEST_CASE("RETR over an active-mode PORT connection", "[transfer]")
     };
     mock_tcp_connect_fn = Hook::fn;
 
-    REQUIRE(send_cmd(c, "PORT 10,0,0,2,4,2\r\n") == "200 PORT command successful.\r\n");
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
     REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty()); /* async: awaiting connect */
     mock_tcp_connect_fn = nullptr;
 
@@ -845,6 +1299,62 @@ TEST_CASE("RETR over an active-mode PORT connection", "[transfer]")
 
     REQUIRE(out.find("abcde") != std::string::npos);
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+}
+
+TEST_CASE("active-mode data connection failures are reported", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    SECTION("no PCB available for the outgoing connection") {
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+        mock_tcp_new_fn = []() -> struct tcp_pcb * { return nullptr; };
+        REQUIRE(send_cmd(c, "RETR file.bin\r\n") == "425 Can't open data connection.\r\n");
+        mock_tcp_new_fn = nullptr;
+    }
+
+    SECTION("tcp_connect refuses immediately") {
+        static struct tcp_pcb *s_aborted;
+        s_aborted = nullptr;
+        mock_tcp_abort_fn = [](struct tcp_pcb *p) { s_aborted = p; };
+        mock_tcp_connect_fn = [](struct tcp_pcb *, const ip_addr_t *, u16_t,
+                                 tcp_connected_fn) -> err_t { return ERR_RTE; };
+
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+        REQUIRE(send_cmd(c, "RETR file.bin\r\n") == "425 Can't open data connection.\r\n");
+        REQUIRE(s_aborted != nullptr);
+
+        mock_tcp_connect_fn = nullptr;
+        mock_tcp_abort_fn = nullptr;
+    }
+
+    SECTION("the connect completes with an error") {
+        static tcp_connected_fn s_cb;
+        static struct tcp_pcb  *s_pcb;
+        s_cb = nullptr;
+        s_pcb = nullptr;
+        mock_tcp_connect_fn = [](struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
+                                 tcp_connected_fn connected) -> err_t {
+            s_pcb = pcb;
+            s_cb  = connected;
+            return ERR_OK;
+        };
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+        REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty());
+        mock_tcp_connect_fn = nullptr;
+
+        int idx = mock_tcp_pcb_index(s_pcb);
+        u16_t before = mock_tcp_write_len;
+        /* lwIP has already freed the PCB by the time it reports the failure. */
+        REQUIRE(s_cb(mock_tcp_cb_arg[idx], nullptr, ERR_ABRT) == ERR_OK);
+        REQUIRE(written_since(before) == "425 Can't open data connection.\r\n");
+
+        /* A detached connected callback must be harmless. */
+        REQUIRE(s_cb(nullptr, nullptr, ERR_ABRT) == ERR_OK);
+    }
+
+    /* Every failure path must leave the session able to transfer again. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
 /* ==================================================================== */
@@ -877,6 +1387,61 @@ TEST_CASE("STOR receives uploaded data and closes cleanly", "[transfer]")
     before = mock_tcp_write_len;
     mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
     REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+
+    /* State is reset, so the next transfer is accepted. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("STOR writes every pbuf in a chain", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    static std::string s_written;
+    s_written.clear();
+    mock_lfs_file_write_fn = [](lfs_t *, lfs_file_t *, const void *buf,
+                                lfs_size_t size) -> lfs_ssize_t {
+        s_written.append(static_cast<const char *>(buf), size);
+        return (lfs_ssize_t)size;
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    std::string a = "first-", b = "second";
+    struct pbuf p2 = make_pbuf(b);
+    struct pbuf p1 = make_pbuf(a);
+    p1.next    = &p2;
+    p1.tot_len = (u16_t)(p1.len + p2.len);
+
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, &p1, ERR_OK);
+    REQUIRE(s_written == "first-second");
+}
+
+TEST_CASE("a detached data recv callback frees the pbuf and stops", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    static int s_frees;
+    s_frees = 0;
+    mock_pbuf_free_fn = [](struct pbuf *) -> u8_t { s_frees++; return 1; };
+
+    std::string chunk = "x";
+    struct pbuf p = make_pbuf(chunk);
+    REQUIRE(mock_tcp_cb_recv[data_idx](nullptr, data_pcb, &p, ERR_OK) == ERR_OK);
+    REQUIRE(s_frees == 1);
+    REQUIRE(mock_tcp_cb_recv[data_idx](nullptr, data_pcb, nullptr, ERR_OK) == ERR_OK);
+    REQUIRE(s_frees == 1);
+
+    mock_pbuf_free_fn = nullptr;
 }
 
 TEST_CASE("STOR fails when the file cannot be created", "[transfer]")
@@ -933,4 +1498,27 @@ TEST_CASE("ABOR replies ok and tears down any data connection", "[transfer]")
     /* A subsequent LIST needs PASV/PORT again — proves the data channel
      * state was reset. */
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("closing a session releases an open file and directory", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    static int s_file_closes, s_dir_closes;
+    s_file_closes = 0;
+    s_dir_closes  = 0;
+    mock_lfs_file_close_fn = [](lfs_t *, lfs_file_t *) -> int { s_file_closes++; return 0; };
+    mock_lfs_dir_close_fn  = [](lfs_t *, lfs_dir_t *) -> int  { s_dir_closes++;  return 0; };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR a.txt\r\n").empty());
+    REQUIRE(send_cmd(c, "QUIT\r\n") == "221 Goodbye.\r\n");
+    REQUIRE(s_file_closes == 1);
+
+    Client c2 = connect_client();
+    REQUIRE(send_cmd(c2, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c2, "LIST\r\n").empty());
+    REQUIRE(send_cmd(c2, "QUIT\r\n") == "221 Goodbye.\r\n");
+    REQUIRE(s_dir_closes == 1);
 }

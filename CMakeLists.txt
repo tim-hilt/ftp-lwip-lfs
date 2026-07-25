@@ -35,26 +35,38 @@ target_include_directories(ftp_mocks PUBLIC
 
 # --------------------------------------------------------------------
 # ftp_server — compiled against mock headers
+#
+# FTP_SERVER_USER / FTP_SERVER_PASS are compile-time constants, so the
+# credential paths can only be tested by building a second copy of the
+# library that defines them. Extra arguments become PUBLIC compile
+# definitions, visible to the linked test file as well.
 # --------------------------------------------------------------------
-add_library(ftp_server STATIC ${CMAKE_CURRENT_SOURCE_DIR}/ftp_server.c)
-target_include_directories(ftp_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(ftp_server PUBLIC ftp_mocks)
-target_compile_options(ftp_server PRIVATE
-    -Werror
-    -Wunused-function
-    -Wunused-variable
-    -Wunused-parameter
-    -Wunused-but-set-variable
-    -Wunused-macros
-    -Wunused-const-variable
-)
-if(FTP_SERVER_ENABLE_CLANG_TIDY)
-    set_target_properties(ftp_server PROPERTIES C_CLANG_TIDY "${FTP_SERVER_CLANG_TIDY_COMMAND}")
-endif()
-if(FTP_SERVER_ENABLE_COVERAGE)
-    target_compile_options(ftp_server PRIVATE --coverage -O0 -g)
-    target_link_options(ftp_server PUBLIC --coverage)
-endif()
+function(ftp_add_server_library name)
+    add_library(${name} STATIC ${CMAKE_CURRENT_SOURCE_DIR}/ftp_server.c)
+    target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${name} PUBLIC ftp_mocks)
+    if(ARGN)
+        target_compile_definitions(${name} PUBLIC ${ARGN})
+    endif()
+    target_compile_options(${name} PRIVATE
+        -Werror
+        -Wunused-function
+        -Wunused-variable
+        -Wunused-parameter
+        -Wunused-but-set-variable
+        -Wunused-macros
+        -Wunused-const-variable
+    )
+    if(FTP_SERVER_ENABLE_CLANG_TIDY)
+        set_target_properties(${name} PROPERTIES C_CLANG_TIDY "${FTP_SERVER_CLANG_TIDY_COMMAND}")
+    endif()
+    if(FTP_SERVER_ENABLE_COVERAGE)
+        target_compile_options(${name} PRIVATE --coverage -O0 -g)
+        target_link_options(${name} PUBLIC --coverage)
+    endif()
+endfunction()
+
+ftp_add_server_library(ftp_server)
 
 # --------------------------------------------------------------------
 # Unit tests (opt-in via -DFTP_SERVER_BUILD_TESTS=ON)
@@ -78,15 +90,24 @@ if(FTP_SERVER_BUILD_TESTS)
         list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
     endif()
 
-    add_executable(ftp_tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp
-    )
-    target_link_libraries(ftp_tests PRIVATE
-        ftp_server
-        Catch2::Catch2WithMain
-    )
-
     include(CTest)
     include(Catch)
-    catch_discover_tests(ftp_tests)
+
+    function(ftp_add_test_executable name source library)
+        add_executable(${name} ${CMAKE_CURRENT_SOURCE_DIR}/${source})
+        target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(${name} PRIVATE ${library} Catch2::Catch2WithMain)
+        catch_discover_tests(${name} TEST_PREFIX "${name}: ")
+    endfunction()
+
+    # Default build: no credentials configured, every client logged in on accept.
+    ftp_add_test_executable(ftp_tests tests/test_main.cpp ftp_server)
+
+    # Credential builds — see tests/test_auth.cpp.
+    ftp_add_server_library(ftp_server_auth
+        FTP_SERVER_USER=\"tester\" FTP_SERVER_PASS=\"s3cret\")
+    ftp_add_test_executable(ftp_tests_auth tests/test_auth.cpp ftp_server_auth)
+
+    ftp_add_server_library(ftp_server_user_only FTP_SERVER_USER=\"tester\")
+    ftp_add_test_executable(ftp_tests_user_only tests/test_auth.cpp ftp_server_user_only)
 endif()

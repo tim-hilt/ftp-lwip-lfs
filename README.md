@@ -105,9 +105,13 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 
 ## Notes
 
-- Only one data connection is active per session at a time.
+- Only one data connection is active per session at a time. A transfer command issued while another is still pending is answered `450 Transfer already in progress`; `PASV` and `ABOR` both reset the state.
 - Each session's LFS file cache buffer (`FTP_SERVER_FILE_CACHE_SIZE`) must be >= `lfs_config.cache_size`; `ftp_server_init()` returns `ERR_ARG` otherwise.
 - Designed for constrained targets: no dynamic allocation beyond the static `s_sessions[FTP_SERVER_MAX_CLIENTS]` table.
+- Only binary transfers are implemented, so a session defaults to `TYPE I` and `TYPE A` is rejected with `504`.
+- `PORT` only accepts the control connection's own peer address; pointing it at a third-party host is refused with `501` ([RFC 2577](https://www.rfc-editor.org/rfc/rfc2577) FTP-bounce mitigation).
+- `DELE` refuses directories and `RMD` refuses regular files, even though littlefs removes both with `lfs_remove()`.
+- A filesystem error part-way through a transfer ends it with `451`, and a data-connection reset with `426` — never a misleading `226`.
 
 ## Continuous Integration
 
@@ -116,7 +120,7 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 | Job           | What it checks                                                          |
 |---------------|--------------------------------------------------------------------------|
 | `build`       | `ftp_server.c`/`.h` compile cleanly (`-Werror` + unused-code warnings). |
-| `unit-tests`  | The Catch2 suite (`tests/test_main.cpp`) builds and all tests pass.     |
+| `unit-tests`  | All three Catch2 suites build and pass (see [Testing](#testing)).      |
 | `clang-tidy`  | Static analysis is clean (see below).                                  |
 | `coverage`    | Computes line coverage of `ftp_server.c` (via `gcovr`) after `build`/`unit-tests` pass; on `main` pushes it commits the badge data to `.github/badges/coverage.json`. |
 
@@ -128,9 +132,19 @@ Unit tests exercise `ftp_server.c` against the mock lwIP/LittleFS headers in `te
 
 ```sh
 cmake -S . -B build -DFTP_SERVER_BUILD_TESTS=ON
-cmake --build build --target ftp_tests
+cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+`FTP_SERVER_USER` / `FTP_SERVER_PASS` are compile-time constants, so the login paths cannot be reached from a single build. CMake therefore produces three executables, each linked against its own copy of the library:
+
+| Executable            | Library configuration              | Covers                                  |
+|-----------------------|------------------------------------|-----------------------------------------|
+| `ftp_tests`           | no credentials (the default)       | `tests/test_main.cpp` — the protocol     |
+| `ftp_tests_auth`      | `FTP_SERVER_USER` + `FTP_SERVER_PASS` | `tests/test_auth.cpp` — USER/PASS flow |
+| `ftp_tests_user_only` | `FTP_SERVER_USER` only             | `tests/test_auth.cpp` — USER logs in     |
+
+The `coverage` job merges the `.gcda` files from all three, so the reported figure covers the credential paths too. `tests/ftp_test_support.hpp` holds the shared harness that drives ftp_server.c's registered lwIP callbacks.
 
 ## Static Analysis
 

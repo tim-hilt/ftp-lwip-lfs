@@ -28,7 +28,7 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 /** Maximum number of fake PCBs the mock can hand out (no heap). */
-#define MOCK_TCP_MAX_PCBS 16
+#define MOCK_TCP_MAX_PCBS 64
 
 /* ------------------------------------------------------------------ */
 /*  Per-function hooks                                                */
@@ -78,6 +78,18 @@ extern u16_t (*mock_pbuf_copy_partial_fn)(const struct pbuf *p, void *dataptr,
 extern char   mock_tcp_write_buf[MOCK_TCP_WRITE_CAPTURE_SIZE];
 /** Current write position in mock_tcp_write_buf. */
 extern u16_t  mock_tcp_write_len;
+
+/**
+ * When non-zero, the default tcp_write() consumes pcb->snd_buf and returns
+ * ERR_MEM once the send window is exhausted, the way real lwIP does. Off by
+ * default so the many tests that only inspect replies never have to manage
+ * the window; switch it on to exercise back-pressure and the tcp_sent path,
+ * and call mock_tcp_ack() to simulate the peer ACKing bytes.
+ */
+extern u8_t   mock_tcp_track_sndbuf;
+
+/** Give @p pcb another @p len bytes of send window (simulates an ACK). */
+void mock_tcp_ack(struct tcp_pcb *pcb, u16_t len);
 
 /* ------------------------------------------------------------------ */
 /*  Callback capture                                                  */

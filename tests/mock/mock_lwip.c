@@ -53,6 +53,12 @@ static int            s_pcb_next;
 
 char   mock_tcp_write_buf[MOCK_TCP_WRITE_CAPTURE_SIZE];
 u16_t  mock_tcp_write_len;
+u8_t   mock_tcp_track_sndbuf;
+
+void mock_tcp_ack(struct tcp_pcb *pcb, u16_t len)
+{
+    if (pcb) pcb->snd_buf = (u16_t)(pcb->snd_buf + len);
+}
 
 /* ------------------------------------------------------------------ */
 /*  Callback capture arrays                                           */
@@ -114,7 +120,8 @@ void mock_lwip_reset(void)
 
     /* Capture buffer */
     memset(mock_tcp_write_buf, 0, sizeof(mock_tcp_write_buf));
-    mock_tcp_write_len = 0;
+    mock_tcp_write_len    = 0;
+    mock_tcp_track_sndbuf = 0;
 
     /* Callback arrays */
     memset(mock_tcp_cb_arg,    0, sizeof(mock_tcp_cb_arg));
@@ -229,7 +236,11 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *dataptr,
         return mock_tcp_write_fn(pcb, dataptr, len, apiflags);
 
     /* Default: append to capture buffer. */
-    (void)pcb; (void)apiflags;
+    (void)apiflags;
+    if (mock_tcp_track_sndbuf && pcb) {
+        if (pcb->snd_buf < len) return ERR_MEM;
+        pcb->snd_buf = (u16_t)(pcb->snd_buf - len);
+    }
     u16_t room = (u16_t)(MOCK_TCP_WRITE_CAPTURE_SIZE - mock_tcp_write_len);
     u16_t copy = (len < room) ? len : room;
     if (copy > 0) {

@@ -29,7 +29,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFTP_SERVER_BUILD_TESTS=ON
 
       - name: Build tests
-        run: cmake --build build --target ftp_tests -j
+        run: cmake --build build -j
 
       - name: Run tests
         working-directory: build
@@ -62,8 +62,10 @@ jobs:
       - name: Configure (coverage instrumentation)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFTP_SERVER_BUILD_TESTS=ON -DFTP_SERVER_ENABLE_COVERAGE=ON
 
+      # All test executables, including the separately configured credential
+      # builds — their .gcda files are merged by gcovr below.
       - name: Build tests
-        run: cmake --build build --target ftp_tests -j
+        run: cmake --build build -j
 
       - name: Run tests
         working-directory: build
@@ -72,7 +74,8 @@ jobs:
       - name: Compute coverage percentage
         id: cov
         run: |
-          gcovr --root . --filter '.*ftp_server\.c$' --json-summary-pretty --json-summary coverage-summary.json build/
+          gcovr --root . --filter '.*ftp_server\.c$' --merge-mode-functions=merge-use-line-min \
+                --json-summary-pretty --json-summary coverage-summary.json build/
           pct=$(python3 -c "import json; print(round(json.load(open('coverage-summary.json'))['line_percent'], 1))")
           echo "pct=$pct" >> "$GITHUB_OUTPUT"
 
