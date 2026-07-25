@@ -108,12 +108,11 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 
 ## Static Analysis
 
-`ftp_server.c`/`.h` are linted with [clang-tidy](https://clang.llvm.org/extra/clang-tidy/) (config: `.clang-tidy`); `lwip/` and `littlefs/` are vendored submodules and are excluded. Ruleset covers `bugprone-*`, `cert-*`, `clang-analyzer-*`, `misc-*`, `performance-*`, `portability-*`, `readability-*`, plus `cppcoreguidelines-no-malloc`/`hicpp-no-malloc` to enforce the no-heap-allocation guideline.
+`ftp_server.c`/`.h` are linted with [clang-tidy](https://clang.llvm.org/extra/clang-tidy/) (config: `.clang-tidy`). Ruleset covers `bugprone-*`, `cert-*`, `clang-analyzer-*`, `misc-*`, `performance-*`, `portability-*`, `readability-*`, plus `cppcoreguidelines-no-malloc`/`hicpp-no-malloc` to enforce the no-heap-allocation guideline. The build compiles `ftp_server.c` against lightweight mock headers (in `tests/mock/`) that provide the lwIP and LittleFS API surface — no submodules or vendored sources required.
 
 Recommended — use the provided `Dockerfile`, which pins the exact toolchain (`ubuntu:24.04` + apt's `clang-tidy`) the CI workflow (`.github/workflows/clang-tidy.yml`) builds and runs, so results are deterministic and match CI exactly — no local clang-tidy version skew:
 
 ```sh
-git submodule update --init --recursive   # once, if not already checked out
 docker build -t ftp-lwip-lfs-clang-tidy .
 docker run --rm -v "$PWD":/repo ftp-lwip-lfs-clang-tidy
 ```

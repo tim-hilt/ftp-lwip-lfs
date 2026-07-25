@@ -4,9 +4,6 @@
 # Usage:
 #   docker build -t ftp-lwip-lfs-clang-tidy .
 #   docker run --rm -v "$PWD":/repo ftp-lwip-lfs-clang-tidy
-#
-# Requires the littlefs/lwip submodules to be checked out first:
-#   git submodule update --init --recursive
 
 FROM ubuntu:24.04
 
@@ -14,8 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang-tidy \
         cmake \
         build-essential \
-        git \
-        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /repo
