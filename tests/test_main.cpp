@@ -141,15 +141,16 @@ TEST_CASE("ftp_server_init rejects an oversized lfs cache_size", "[init]")
     mock_lfs_reset();
     mock_lfs_cfg.cache_size = FTP_SERVER_FILE_CACHE_SIZE + 1;
 
-    int calls = 0;
+    static int s_tcp_new_calls;
+    s_tcp_new_calls = 0;
     struct Counter {
-        static struct tcp_pcb *fn(void) { return nullptr; }
+        static struct tcp_pcb *fn(void) { s_tcp_new_calls++; return nullptr; }
     };
     mock_tcp_new_fn = Counter::fn;
     REQUIRE(ftp_server_init(&mock_lfs) == ERR_ARG);
     /* tcp_new() must never be reached — the cache check happens first. */
+    REQUIRE(s_tcp_new_calls == 0);
     mock_tcp_new_fn = nullptr;
-    (void)calls;
 }
 
 TEST_CASE("ftp_server_init succeeds and registers the accept callback", "[init]")
@@ -158,14 +159,19 @@ TEST_CASE("ftp_server_init succeeds and registers the accept callback", "[init]"
     REQUIRE(mock_tcp_cb_accept[kListenIdx] != nullptr);
 }
 
-TEST_CASE("ftp_server_deinit tears down without crashing and is idempotent", "[init]")
+TEST_CASE("ftp_server_deinit closes sessions and is idempotent", "[init]")
 {
     init_server();
     Client c = connect_client();
-    (void)c;
+
     ftp_server_deinit();
-    ftp_server_deinit(); /* must be safe to call again */
-    SUCCEED();
+
+    /* The connected session's recv callback must be cleared (session torn down). */
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+    REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
+
+    /* Calling deinit again must not crash. */
+    ftp_server_deinit();
 }
 
 /* ==================================================================== */
@@ -191,7 +197,6 @@ TEST_CASE("beyond FTP_SERVER_MAX_CLIENTS the connection is aborted", "[connect]"
         (void)c;
     }
 
-    struct tcp_pcb *aborted_pcb = nullptr;
     static struct tcp_pcb *s_aborted_pcb;
     s_aborted_pcb = nullptr;
     struct Hook {
@@ -205,23 +210,69 @@ TEST_CASE("beyond FTP_SERVER_MAX_CLIENTS the connection is aborted", "[connect]"
 
     REQUIRE(err == ERR_ABRT);
     REQUIRE(s_aborted_pcb == pcb);
-    aborted_pcb = pcb;
-    (void)aborted_pcb;
+}
+
+TEST_CASE("client disconnect via recv NULL tears down the session", "[connect]")
+{
+    init_server();
+    Client c = connect_client();
+    REQUIRE(mock_tcp_cb_recv[c.idx] != nullptr);
+
+    /* Simulate TCP FIN: lwIP delivers recv(NULL). */
+    err_t err = mock_tcp_cb_recv[c.idx](mock_tcp_cb_arg[c.idx], c.pcb, nullptr, ERR_OK);
+    REQUIRE(err == ERR_OK);
+
+    /* Session must be fully cleaned up. */
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+    REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
+}
+
+TEST_CASE("control error callback cleans up the session", "[connect]")
+{
+    init_server();
+    Client c = connect_client();
+    REQUIRE(mock_tcp_cb_err[c.idx] != nullptr);
+
+    /* lwIP calls the error callback (e.g. on RST) — PCB already freed. */
+    mock_tcp_cb_err[c.idx](mock_tcp_cb_arg[c.idx], ERR_RST);
+
+    /* Session slot must be released so a new client can connect. */
+    Client c2 = connect_client();
+    (void)c2;
+}
+
+TEST_CASE("idle timeout closes the session after enough polls", "[connect]")
+{
+    init_server();
+    Client c = connect_client();
+    REQUIRE(mock_tcp_cb_poll[c.idx] != nullptr);
+
+    /* Fire poll up to (but not including) the limit — session stays alive. */
+    for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS - 1; i++) {
+        err_t err = mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+        REQUIRE(err == ERR_OK);
+        REQUIRE(mock_tcp_cb_recv[c.idx] != nullptr);
+    }
+
+    /* One more poll pushes over the limit. */
+    mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+    REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
 }
 
 /* ==================================================================== */
 /*  Simple post-auth commands (no auth configured -> logged in on accept)*/
 /* ==================================================================== */
 
-TEST_CASE("basic informational commands", "[commands]")
+TEST_CASE("informational commands reply with expected content", "[commands]")
 {
     init_server();
     Client c = connect_client();
 
-    SECTION("SYST") {
+    SECTION("SYST reports UNIX type") {
         REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
     }
-    SECTION("FEAT") {
+    SECTION("FEAT lists supported features") {
         REQUIRE(send_cmd(c, "FEAT\r\n") ==
                 "211-Features:\r\n"
                 " PASV\r\n"
@@ -229,16 +280,16 @@ TEST_CASE("basic informational commands", "[commands]")
                 " UTF8\r\n"
                 "211 End\r\n");
     }
-    SECTION("NOOP") {
+    SECTION("NOOP replies 200") {
         REQUIRE(send_cmd(c, "NOOP\r\n") == "200 NOOP ok.\r\n");
     }
-    SECTION("OPTS UTF8 ON") {
+    SECTION("OPTS UTF8 ON is accepted") {
         REQUIRE(send_cmd(c, "OPTS UTF8 ON\r\n") == "200 UTF8 set to on.\r\n");
     }
-    SECTION("OPTS unsupported option") {
+    SECTION("OPTS rejects unsupported options") {
         REQUIRE(send_cmd(c, "OPTS BOGUS\r\n") == "501 Option not understood.\r\n");
     }
-    SECTION("unknown command") {
+    SECTION("unknown command returns 502") {
         REQUIRE(send_cmd(c, "WOOP\r\n") == "502 Command not implemented.\r\n");
     }
     SECTION("commands are case-insensitive") {
@@ -246,16 +297,22 @@ TEST_CASE("basic informational commands", "[commands]")
     }
 }
 
-TEST_CASE("TYPE only accepts binary mode", "[commands]")
+TEST_CASE("TYPE command", "[commands]")
 {
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "TYPE I\r\n") == "200 Switching to Binary mode.\r\n");
-    REQUIRE(send_cmd(c, "TYPE A\r\n") ==
-            "504 ASCII transfer mode not supported, use binary.\r\n");
-    REQUIRE(send_cmd(c, "TYPE\r\n") ==
-            "504 ASCII transfer mode not supported, use binary.\r\n");
+    SECTION("accepts binary mode") {
+        REQUIRE(send_cmd(c, "TYPE I\r\n") == "200 Switching to Binary mode.\r\n");
+    }
+    SECTION("rejects ASCII mode") {
+        REQUIRE(send_cmd(c, "TYPE A\r\n") ==
+                "504 ASCII transfer mode not supported, use binary.\r\n");
+    }
+    SECTION("rejects missing argument") {
+        REQUIRE(send_cmd(c, "TYPE\r\n") ==
+                "504 ASCII transfer mode not supported, use binary.\r\n");
+    }
 }
 
 TEST_CASE("QUIT replies and tears down the session", "[commands]")
@@ -279,6 +336,20 @@ TEST_CASE("multiple commands in one TCP segment are all processed", "[commands]"
 
     REQUIRE(send_cmd(c, "NOOP\r\nNOOP\r\n") ==
             "200 NOOP ok.\r\n200 NOOP ok.\r\n");
+}
+
+TEST_CASE("a command split across two TCP segments is reassembled", "[commands]")
+{
+    init_server();
+    Client c = connect_client();
+
+    /* First segment: partial command without line ending. */
+    std::string reply1 = send_cmd(c, "NOO");
+    REQUIRE(reply1.empty());
+
+    /* Second segment: completes the command. */
+    std::string reply2 = send_cmd(c, "P\r\n");
+    REQUIRE(reply2 == "200 NOOP ok.\r\n");
 }
 
 TEST_CASE("an unterminated line exceeding the buffer is discarded", "[commands]")
@@ -393,47 +464,86 @@ TEST_CASE("a resolved path that overflows FTP_SERVER_PATH_MAX is rejected", "[fs
 }
 
 /* ==================================================================== */
-/*  DELE / MKD / RMD / RNFR / RNTO / SIZE                                */
+/*  X-aliases (XPWD, XCWD, XCUP, XMKD, XRMD)                          */
 /* ==================================================================== */
 
-TEST_CASE("MKD success and failure", "[fs]")
+TEST_CASE("X-aliases map to their standard counterparts", "[commands]")
 {
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "MKD newdir\r\n") == "257 \"/newdir\" created.\r\n");
+    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
+        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
+        return 0;
+    };
 
-    mock_lfs_mkdir_fn = [](lfs_t *, const char *) -> int { return -1; };
-    REQUIRE(send_cmd(c, "MKD newdir\r\n") == "550 Create directory failed.\r\n");
+    SECTION("XPWD behaves like PWD") {
+        REQUIRE(send_cmd(c, "XPWD\r\n") == "257 \"/\" is the current directory.\r\n");
+    }
+    SECTION("XCWD behaves like CWD") {
+        REQUIRE(send_cmd(c, "XCWD sub\r\n") == "250 Directory successfully changed.\r\n");
+        REQUIRE(send_cmd(c, "XPWD\r\n") == "257 \"/sub\" is the current directory.\r\n");
+    }
+    SECTION("XCUP behaves like CDUP") {
+        REQUIRE(send_cmd(c, "XCWD sub\r\n") == "250 Directory successfully changed.\r\n");
+        REQUIRE(send_cmd(c, "XCUP\r\n") == "250 Directory successfully changed.\r\n");
+        REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
+    }
+    SECTION("XMKD behaves like MKD") {
+        REQUIRE(send_cmd(c, "XMKD newdir\r\n") == "257 \"/newdir\" created.\r\n");
+    }
+    SECTION("XRMD behaves like RMD") {
+        REQUIRE(send_cmd(c, "XRMD olddir\r\n") == "250 Remove directory successful.\r\n");
+    }
 }
 
-TEST_CASE("MKD without an argument is rejected", "[fs]")
+/* ==================================================================== */
+/*  DELE / MKD / RMD / RNFR / RNTO / SIZE                              */
+/* ==================================================================== */
+
+TEST_CASE("MKD creates a directory or reports failure", "[fs]")
 {
     init_server();
     Client c = connect_client();
-    REQUIRE(send_cmd(c, "MKD\r\n") == "501 Specify directory name.\r\n");
+
+    SECTION("creates directory successfully") {
+        REQUIRE(send_cmd(c, "MKD newdir\r\n") == "257 \"/newdir\" created.\r\n");
+    }
+    SECTION("reports failure when mkdir fails") {
+        mock_lfs_mkdir_fn = [](lfs_t *, const char *) -> int { return -1; };
+        REQUIRE(send_cmd(c, "MKD newdir\r\n") == "550 Create directory failed.\r\n");
+    }
+    SECTION("rejects missing argument") {
+        REQUIRE(send_cmd(c, "MKD\r\n") == "501 Specify directory name.\r\n");
+    }
 }
 
-TEST_CASE("RMD success and failure", "[fs]")
+TEST_CASE("RMD removes a directory or reports failure", "[fs]")
 {
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "RMD olddir\r\n") == "250 Remove directory successful.\r\n");
-
-    mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { return -1; };
-    REQUIRE(send_cmd(c, "RMD olddir\r\n") == "550 Remove directory failed.\r\n");
+    SECTION("removes directory successfully") {
+        REQUIRE(send_cmd(c, "RMD olddir\r\n") == "250 Remove directory successful.\r\n");
+    }
+    SECTION("reports failure when remove fails") {
+        mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { return -1; };
+        REQUIRE(send_cmd(c, "RMD olddir\r\n") == "550 Remove directory failed.\r\n");
+    }
 }
 
-TEST_CASE("DELE success and failure", "[fs]")
+TEST_CASE("DELE deletes a file or reports failure", "[fs]")
 {
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "DELE file.txt\r\n") == "250 Delete operation successful.\r\n");
-
-    mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { return -1; };
-    REQUIRE(send_cmd(c, "DELE file.txt\r\n") == "550 Delete operation failed.\r\n");
+    SECTION("deletes file successfully") {
+        REQUIRE(send_cmd(c, "DELE file.txt\r\n") == "250 Delete operation successful.\r\n");
+    }
+    SECTION("reports failure when remove fails") {
+        mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { return -1; };
+        REQUIRE(send_cmd(c, "DELE file.txt\r\n") == "550 Delete operation failed.\r\n");
+    }
 }
 
 TEST_CASE("RNFR / RNTO rename flow", "[fs]")
@@ -462,22 +572,25 @@ TEST_CASE("RNFR / RNTO rename flow", "[fs]")
     }
 }
 
-TEST_CASE("SIZE reports file size or fails for non-files", "[fs]")
+TEST_CASE("SIZE reports file size or rejects non-files", "[fs]")
 {
     init_server();
     Client c = connect_client();
 
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_REG; info->size = 12345; }
-        return 0;
-    };
-    REQUIRE(send_cmd(c, "SIZE file.bin\r\n") == "213 12345\r\n");
-
-    mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
-        if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
-        return 0;
-    };
-    REQUIRE(send_cmd(c, "SIZE adir\r\n") == "550 Could not get file size.\r\n");
+    SECTION("reports size for a regular file") {
+        mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
+            if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_REG; info->size = 12345; }
+            return 0;
+        };
+        REQUIRE(send_cmd(c, "SIZE file.bin\r\n") == "213 12345\r\n");
+    }
+    SECTION("rejects directories") {
+        mock_lfs_stat_fn = [](lfs_t *, const char *, struct lfs_info *info) -> int {
+            if (info) { std::memset(info, 0, sizeof(*info)); info->type = LFS_TYPE_DIR; }
+            return 0;
+        };
+        REQUIRE(send_cmd(c, "SIZE adir\r\n") == "550 Could not get file size.\r\n");
+    }
 }
 
 /* ==================================================================== */
@@ -518,10 +631,18 @@ TEST_CASE("PORT rejects malformed arguments", "[port]")
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "PORT garbage\r\n") == "501 Syntax error in parameters.\r\n");
-    REQUIRE(send_cmd(c, "PORT 10,0,0,1,4\r\n") == "501 Syntax error in parameters.\r\n");
-    REQUIRE(send_cmd(c, "PORT 300,0,0,1,4,1\r\n") == "501 Syntax error in parameters.\r\n");
-    REQUIRE(send_cmd(c, "PORT\r\n") == "501 Syntax error in parameters.\r\n");
+    SECTION("non-numeric input") {
+        REQUIRE(send_cmd(c, "PORT garbage\r\n") == "501 Syntax error in parameters.\r\n");
+    }
+    SECTION("too few components") {
+        REQUIRE(send_cmd(c, "PORT 10,0,0,1,4\r\n") == "501 Syntax error in parameters.\r\n");
+    }
+    SECTION("octet value out of range") {
+        REQUIRE(send_cmd(c, "PORT 300,0,0,1,4,1\r\n") == "501 Syntax error in parameters.\r\n");
+    }
+    SECTION("missing argument") {
+        REQUIRE(send_cmd(c, "PORT\r\n") == "501 Syntax error in parameters.\r\n");
+    }
 }
 
 TEST_CASE("LIST/RETR before PASV or PORT fails", "[transfer]")
@@ -535,7 +656,7 @@ TEST_CASE("LIST/RETR before PASV or PORT fails", "[transfer]")
 /*  LIST / NLST                                                         */
 /* ==================================================================== */
 
-TEST_CASE("LIST streams directory entries and completes", "[transfer]")
+TEST_CASE("LIST streams directory entries in Unix format", "[transfer]")
 {
     init_server();
     Client c = connect_client();
@@ -568,12 +689,26 @@ TEST_CASE("LIST streams directory entries and completes", "[transfer]")
     std::string out = written_since(before);
 
     REQUIRE(out.rfind("150 Here comes the data.\r\n", 0) == 0);
-    REQUIRE(out.find("foo.txt") != std::string::npos);
-    REQUIRE(out.find("sub") != std::string::npos);
+
+    /* Verify Unix-style listing format: permission string, owner, size, name. */
+    REQUIRE(out.find("-rw-r--r-- 1 ftp ftp         42 Jan 01  2000 foo.txt\r\n") != std::string::npos);
+    REQUIRE(out.find("drwxr-xr-x 1 ftp ftp          0 Jan 01  2000 sub\r\n") != std::string::npos);
+
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
 }
 
-TEST_CASE("NLST lists bare names", "[transfer]")
+TEST_CASE("LIST fails when directory cannot be opened", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_dir_open_fn = [](lfs_t *, lfs_dir_t *, const char *) -> int { return -1; };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "LIST\r\n") == "550 Failed to open directory.\r\n");
+}
+
+TEST_CASE("NLST lists only bare filenames", "[transfer]")
 {
     init_server();
     Client c = connect_client();
@@ -583,6 +718,7 @@ TEST_CASE("NLST lists bare names", "[transfer]")
     mock_lfs_dir_read_fn = [](lfs_t *, lfs_dir_t *, struct lfs_info *info) -> int {
         if (call == 0) {
             info->type = LFS_TYPE_REG;
+            info->size = 99;
             std::strcpy(info->name, "one.txt");
             call++;
             return 1;
@@ -596,8 +732,17 @@ TEST_CASE("NLST lists bare names", "[transfer]")
     u16_t before = mock_tcp_write_len;
     accept_pasv_data_connection();
     std::string out = written_since(before);
-    REQUIRE(out.find("one.txt\r\n") != std::string::npos);
-    REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+
+    /* Strip the 150 and 226 control-channel replies to isolate data. */
+    auto data_start = out.find('\n', out.find("150 "));
+    REQUIRE(data_start != std::string::npos);
+    data_start++;
+    auto data_end = out.find("226 Transfer complete.\r\n");
+    REQUIRE(data_end != std::string::npos);
+    std::string data_payload = out.substr(data_start, data_end - data_start);
+
+    /* NLST must emit only "name\r\n" — no permission string, no size. */
+    REQUIRE(data_payload == "one.txt\r\n");
 }
 
 /* ==================================================================== */
