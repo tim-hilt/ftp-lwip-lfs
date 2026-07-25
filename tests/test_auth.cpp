@@ -144,6 +144,23 @@ TEST_CASE("a fresh connection starts unauthenticated", "[auth]")
     REQUIRE(send_cmd(c2, "SYST\r\n") == "530 Please login with USER and PASS.\r\n");
 }
 
+TEST_CASE("a rejected USER drops an established login", "[auth][security]")
+{
+    init_server();
+    Client c = connect_client();
+    login(c);
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
+
+    /* The client asked to become somebody else and was refused, so it must
+     * not keep the session it already had. */
+    REQUIRE(send_cmd(c, "USER intruder\r\n") == "530 Login incorrect.\r\n");
+    REQUIRE(send_cmd(c, "PWD\r\n") == "530 Please login with USER and PASS.\r\n");
+
+    /* Logging back in as the configured user still works. */
+    login(c);
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
+}
+
 TEST_CASE("USER can be re-issued to restart authentication", "[auth]")
 {
     init_server();

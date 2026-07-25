@@ -146,9 +146,23 @@ static uint16_t           s_next_pasv_port = FTP_SERVER_PASV_PORT_MIN;
  * Only valid until the ftp_send_reply() that consumes it returns. */
 static char               s_reply[FTP_SERVER_PATH_MAX + 64];
 
+/* Scratch for the resolved path a command operates on, shared for the same
+ * reason as s_reply: command handlers never nest, so one buffer serves them
+ * all and no handler needs a FTP_SERVER_PATH_MAX frame of its own. Only valid
+ * until the handler that called ftp_arg_path() returns. */
+static char               s_path[FTP_SERVER_PATH_MAX];
+
 /* Replies reused by several handlers — one copy in .rodata each. */
 static const char ftp_reply_need_file[] = "501 Specify file name.\r\n";
 static const char ftp_reply_need_dir[]  = "501 Specify directory name.\r\n";
+static const char ftp_reply_login_ok[]  = "230 Login successful.\r\n";
+static const char ftp_reply_login_bad[] = "530 Login incorrect.\r\n";
+static const char ftp_reply_complete[]  = "226 Transfer complete.\r\n";
+static const char ftp_reply_aborted[]   =
+    "426 Connection closed; transfer aborted.\r\n";
+static const char ftp_reply_no_data[]   = "425 Can't open data connection.\r\n";
+static const char ftp_reply_local_err[] =
+    "451 Requested action aborted: local error in processing.\r\n";
 
 /* ------------------------------------------------------------------ */
 /*  Forward declarations                                              */
@@ -180,6 +194,16 @@ static void ftp_strlcpy(char *dst, const char *src, size_t size)
 {
     strncpy(dst, src, size - 1);
     dst[size - 1] = '\0';
+}
+
+/** Case-insensitive strcmp — strcasecmp is POSIX, not C99. */
+static int ftp_strcasecmp(const char *a, const char *b)
+{
+    while (*a && toupper((unsigned char)*a) == toupper((unsigned char)*b)) {
+        a++;
+        b++;
+    }
+    return toupper((unsigned char)*a) - toupper((unsigned char)*b);
 }
 
 /**
@@ -292,25 +316,30 @@ static int ftp_resolve_path(const ftp_session_t *s, const char *arg, char *out)
 }
 
 /**
- * Resolve a command argument into @p out (size FTP_SERVER_PATH_MAX),
- * replying on failure so the caller can simply return.
+ * Resolve a command argument into the shared s_path buffer, replying on
+ * failure so the caller can simply return.
  *
- * @param missing Reply sent when @p arg is NULL, or NULL to treat a missing
+ * @param missing Reply sent when @p arg is absent, or NULL to treat an absent
  *                argument as "the current directory".
- * @return 0 on success, -1 after a reply has been sent.
+ * @return s_path on success, NULL after a reply has been sent.
  */
-static int ftp_arg_path(ftp_session_t *s, const char *arg, char *out,
-                        const char *missing)
+static const char *ftp_arg_path(ftp_session_t *s, const char *arg,
+                                const char *missing)
 {
+    /* A trailing space ("RMD ") parses to an empty argument rather than no
+     * argument at all. Resolving it would yield the CWD, so `RMD ` would
+     * cheerfully delete the directory the client is sitting in. */
+    if (arg && arg[0] == '\0') arg = NULL;
+
     if (!arg && missing) {
         ftp_send_reply(s, missing);
-        return -1;
+        return NULL;
     }
-    if (ftp_resolve_path(s, arg, out) < 0) {
+    if (ftp_resolve_path(s, arg, s_path) < 0) {
         ftp_send_reply(s, "550 Path too long.\r\n");
-        return -1;
+        return NULL;
     }
-    return 0;
+    return s_path;
 }
 
 /* ------------------------------------------------------------------ */
@@ -398,6 +427,23 @@ static void ftp_close_session(ftp_session_t *s)
     if (ftp_close_pcb(&s->ctrl_pcb, 0)) s->ctrl_aborted = 1;
     s->rnfr[0] = '\0';
     s->in_use = 0;
+}
+
+/**
+ * Tear the data channel down on behalf of something *other* than the transfer
+ * itself — ABOR, or a PASV/PORT that supersedes it.
+ *
+ * A transfer that already got its "150" owes the client a completion reply;
+ * without the 426 the client blocks waiting for a 226 that will never come.
+ * A transfer that is merely armed (command issued, data connection not up
+ * yet) never announced itself, so it is dropped silently.
+ */
+static void ftp_abort_transfer(ftp_session_t *s)
+{
+    int announced = (s->data_mode != FTP_DATA_IDLE &&
+                     s->data_pcb != NULL && !s->data_connecting);
+    ftp_close_data(s);
+    if (announced) ftp_send_reply(s, ftp_reply_aborted);
 }
 
 /**
@@ -523,16 +569,15 @@ static void ftp_send_next_data(ftp_session_t *s)
         if (flushed == 0) return;   /* wait for tcp_sent */
         if (flushed < 0) {
             ftp_close_data(s);
-            ftp_send_reply(s, "426 Connection closed; transfer aborted.\r\n");
+            ftp_send_reply(s, ftp_reply_aborted);
             return;
         }
 
         int n = ftp_fill_next_chunk(s);
         if (n < 0) {
             ftp_close_data(s);
-            ftp_send_reply(s, (n == FTP_CHUNK_ERR)
-                ? "451 Requested action aborted: local error in processing.\r\n"
-                : "226 Transfer complete.\r\n");
+            ftp_send_reply(s, (n == FTP_CHUNK_ERR) ? ftp_reply_local_err
+                                                   : ftp_reply_complete);
             return;
         }
 
@@ -570,7 +615,7 @@ static err_t ftp_data_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 
     if (err != ERR_OK) {
         s->data_pcb = NULL; /* already freed by lwIP */
-        ftp_send_reply(s, "425 Can't open data connection.\r\n");
+        ftp_send_reply(s, ftp_reply_no_data);
         ftp_close_data(s);
         return ERR_OK;
     }
@@ -643,7 +688,7 @@ static void ftp_begin_transfer(ftp_session_t *s)
             s->data_connecting = 0;
             tcp_abort(pcb);
         }
-        ftp_send_reply(s, "425 Can't open data connection.\r\n");
+        ftp_send_reply(s, ftp_reply_no_data);
         ftp_close_data(s);
         return;
     }
@@ -712,9 +757,9 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         ftp_data_mode_t mode = s->data_mode;
         ftp_close_data(s);
         if (mode == FTP_DATA_STOR) {
-            ftp_send_reply(s, "226 Transfer complete.\r\n");
+            ftp_send_reply(s, ftp_reply_complete);
         } else if (mode != FTP_DATA_IDLE) {
-            ftp_send_reply(s, "426 Connection closed; transfer aborted.\r\n");
+            ftp_send_reply(s, ftp_reply_aborted);
         }
         return s->data_aborted ? ERR_ABRT : ERR_OK;
     }
@@ -769,12 +814,19 @@ static void ftp_data_err(void *arg, err_t err)
 
     /* PCB is already freed by lwIP before the error callback fires. */
     s->data_pcb = NULL;
+
+    /* lwIP reports a *failed* active-mode connect through this callback rather
+     * than through ftp_data_connected(), and a connection that never opened is
+     * a 425, not a transfer that died in flight. */
+    int connecting       = s->data_connecting;
     int was_transferring = (s->data_mode != FTP_DATA_IDLE);
     ftp_close_data(s);   /* handles pasv_listen, file, dir, all flags */
 
     /* Without this the client waits for a 226 that will never arrive. */
-    if (was_transferring) {
-        ftp_send_reply(s, "426 Connection closed; transfer aborted.\r\n");
+    if (connecting) {
+        ftp_send_reply(s, ftp_reply_no_data);
+    } else if (was_transferring) {
+        ftp_send_reply(s, ftp_reply_aborted);
     }
 }
 
@@ -813,13 +865,7 @@ static void cmd_feat(ftp_session_t *s, const char *arg)
 
 static void cmd_opts(ftp_session_t *s, const char *arg)
 {
-    char upper[FTP_SERVER_CMD_BUF_SIZE];
-    if (arg) {
-        ftp_strlcpy(upper, arg, sizeof(upper));
-        for (char *p = upper; *p; p++) *p = (char)toupper((unsigned char)*p);
-        arg = upper;
-    }
-    if (arg && strcmp(arg, "UTF8 ON") == 0) {
+    if (arg && ftp_strcasecmp(arg, "UTF8 ON") == 0) {
         ftp_send_reply(s, "200 UTF8 set to on.\r\n");
     } else {
         ftp_send_reply(s, "501 Option not understood.\r\n");
@@ -858,8 +904,8 @@ static void ftp_set_cwd(ftp_session_t *s, const char *path)
 
 static void cmd_cwd(ftp_session_t *s, const char *arg)
 {
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, NULL) < 0) return;
+    const char *path = ftp_arg_path(s, arg, NULL);
+    if (!path) return;
 
     struct lfs_info info;
     if (lfs_stat(s_lfs, path, &info) < 0 || info.type != LFS_TYPE_DIR) {
@@ -872,16 +918,18 @@ static void cmd_cwd(ftp_session_t *s, const char *arg)
 static void cmd_cdup(ftp_session_t *s, const char *arg)
 {
     (void)arg;
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, "..", path, NULL) < 0) return;
+    const char *path = ftp_arg_path(s, "..", NULL);
+    if (!path) return;
     ftp_set_cwd(s, path);
 }
 
 static void cmd_pasv(ftp_session_t *s, const char *arg)
 {
     (void)arg;
-    /* Close any previous data channel. */
-    ftp_close_data(s);
+    /* Close any previous data channel, telling the client if that cut a
+     * transfer short. An undeliverable 426 tears the session down. */
+    ftp_abort_transfer(s);
+    if (!s->ctrl_pcb) return;
 
     struct tcp_pcb *pcb = tcp_new();
     if (!pcb) {
@@ -937,28 +985,29 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     ftp_send_reply(s, s_reply);
 }
 
-static void cmd_port(ftp_session_t *s, const char *arg)
+/**
+ * Parse a PORT argument, "h1,h2,h3,h4,p1,p2", into six 0..255 fields.
+ * @return 0 on success, -1 on any syntax error.
+ */
+static int ftp_parse_port_arg(const char *arg, unsigned long fields[6])
 {
-    if (!arg) {
-        ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
-        return;
-    }
-
-    unsigned long fields[6];
     const char *p = arg;
     for (int i = 0; i < 6; i++) {
         char *end = NULL;
         fields[i] = strtoul(p, &end, 10);
-        if (end == p || fields[i] > 255) {
-            ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
-            return;
-        }
-        char expect = (i < 5) ? ',' : '\0';
-        if (*end != expect) {
-            ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
-            return;
-        }
+        if (end == p || fields[i] > 255) return -1;
+        if (*end != ((i < 5) ? ',' : '\0')) return -1;
         p = end + 1;
+    }
+    return 0;
+}
+
+static void cmd_port(ftp_session_t *s, const char *arg)
+{
+    unsigned long fields[6];
+    if (!arg || ftp_parse_port_arg(arg, fields) < 0) {
+        ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
+        return;
     }
 
     ip_addr_t addr;
@@ -975,7 +1024,11 @@ static void cmd_port(ftp_session_t *s, const char *arg)
         return;
     }
 
-    ftp_close_data(s);
+    /* Supersedes any previous data channel; a transfer already under way is
+     * told so rather than left hanging. */
+    ftp_abort_transfer(s);
+    if (!s->ctrl_pcb) return;
+
     s->port_addr   = addr;
     s->port_port   = (uint16_t)((fields[4] << 8) | fields[5]);
     s->port_active = 1;
@@ -987,8 +1040,6 @@ static void ftp_do_list(ftp_session_t *s, const char *arg, ftp_data_mode_t mode)
 {
     if (ftp_transfer_busy(s)) return;
 
-    char path[FTP_SERVER_PATH_MAX];
-
     /* Skip ls-style options ("-la", "-l -a", ...); whatever follows is a path. */
     const char *list_arg = arg;
     while (list_arg && list_arg[0] == '-') {
@@ -997,7 +1048,8 @@ static void ftp_do_list(ftp_session_t *s, const char *arg, ftp_data_mode_t mode)
         if (*list_arg == '\0') list_arg = NULL;
     }
 
-    if (ftp_arg_path(s, list_arg, path, NULL) < 0) return;
+    const char *path = ftp_arg_path(s, list_arg, NULL);
+    if (!path) return;
 
     if (lfs_dir_open(s_lfs, &s->dir, path) < 0) {
         ftp_send_reply(s, "550 Failed to open directory.\r\n");
@@ -1031,8 +1083,8 @@ static int ftp_open_transfer(ftp_session_t *s, const char *arg,
 {
     if (ftp_transfer_busy(s)) return -1;
 
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return -1;
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
+    if (!path) return -1;
 
     if (lfs_file_opencfg(s_lfs, &s->file, path, flags, &s->file_cfg) < 0) {
         ftp_send_reply(s, fail_msg);
@@ -1048,7 +1100,14 @@ static void cmd_retr(ftp_session_t *s, const char *arg)
     if (ftp_open_transfer(s, arg, FTP_DATA_RETR, LFS_O_RDONLY,
                           "550 Failed to open file.\r\n") < 0) return;
 
+    /* An unchecked error here would be announced to the client as a negative
+     * byte count in the "150" reply. */
     s->retr_size = lfs_file_size(s_lfs, &s->file);
+    if (s->retr_size < 0) {
+        ftp_close_data(s);   /* closes the file just opened, disarms the mode */
+        ftp_send_reply(s, ftp_reply_local_err);
+        return;
+    }
     ftp_begin_transfer(s);
 }
 
@@ -1068,10 +1127,10 @@ static void cmd_stor(ftp_session_t *s, const char *arg)
 static void ftp_do_remove(ftp_session_t *s, const char *arg, uint8_t type,
                           const char *ok_msg, const char *fail_msg)
 {
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path,
-                     (type == LFS_TYPE_DIR) ? ftp_reply_need_dir
-                                            : ftp_reply_need_file) < 0) return;
+    const char *path = ftp_arg_path(s, arg, (type == LFS_TYPE_DIR)
+                                            ? ftp_reply_need_dir
+                                            : ftp_reply_need_file);
+    if (!path) return;
 
     struct lfs_info info;
     if (lfs_stat(s_lfs, path, &info) < 0 || info.type != type ||
@@ -1098,8 +1157,8 @@ static void cmd_rmd(ftp_session_t *s, const char *arg)
 
 static void cmd_mkd(ftp_session_t *s, const char *arg)
 {
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_dir) < 0) return;
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_dir);
+    if (!path) return;
 
     if (lfs_mkdir(s_lfs, path) < 0) {
         ftp_send_reply(s, "550 Create directory failed.\r\n");
@@ -1111,8 +1170,8 @@ static void cmd_mkd(ftp_session_t *s, const char *arg)
 
 static void cmd_rnfr(ftp_session_t *s, const char *arg)
 {
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return;
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
+    if (!path) return;
 
     /* Verify the source exists. */
     struct lfs_info info;
@@ -1126,8 +1185,8 @@ static void cmd_rnfr(ftp_session_t *s, const char *arg)
 
 static void cmd_rnto(ftp_session_t *s, const char *arg)
 {
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return;
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
+    if (!path) return;
 
     if (s->rnfr[0] == '\0') {
         ftp_send_reply(s, "503 RNFR required first.\r\n");
@@ -1143,8 +1202,8 @@ static void cmd_rnto(ftp_session_t *s, const char *arg)
 
 static void cmd_size(ftp_session_t *s, const char *arg)
 {
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return;
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
+    if (!path) return;
 
     struct lfs_info info;
     if (lfs_stat(s_lfs, path, &info) < 0 || info.type != LFS_TYPE_REG) {
@@ -1159,7 +1218,7 @@ static void cmd_size(ftp_session_t *s, const char *arg)
 static void cmd_abor(ftp_session_t *s, const char *arg)
 {
     (void)arg;
-    ftp_close_data(s);
+    ftp_abort_transfer(s);
     ftp_send_reply(s, "226 ABOR command successful.\r\n");
 }
 
@@ -1169,7 +1228,10 @@ static void cmd_user(ftp_session_t *s, const char *arg)
     const char *need_pass = FTP_SERVER_PASS;
 
     if (need_user != NULL && (!arg || strcmp(arg, need_user) != 0)) {
-        ftp_send_reply(s, "530 Login incorrect.\r\n");
+        /* A rejected USER must not leave an earlier successful login standing:
+         * the client asked to become somebody else and was refused. */
+        s->auth = FTP_STATE_WAIT_USER;
+        ftp_send_reply(s, ftp_reply_login_bad);
         return;
     }
     if (need_user != NULL && need_pass != NULL) {
@@ -1178,7 +1240,7 @@ static void cmd_user(ftp_session_t *s, const char *arg)
         return;
     }
     s->auth = FTP_STATE_LOGGED_IN;
-    ftp_send_reply(s, "230 Login successful.\r\n");
+    ftp_send_reply(s, ftp_reply_login_ok);
 }
 
 static void cmd_pass(ftp_session_t *s, const char *arg)
@@ -1192,10 +1254,10 @@ static void cmd_pass(ftp_session_t *s, const char *arg)
     const char *need_pass = FTP_SERVER_PASS;
     if (need_pass != NULL && arg && strcmp(arg, need_pass) == 0) {
         s->auth = FTP_STATE_LOGGED_IN;
-        ftp_send_reply(s, "230 Login successful.\r\n");
+        ftp_send_reply(s, ftp_reply_login_ok);
     } else {
         s->auth = FTP_STATE_WAIT_USER;
-        ftp_send_reply(s, "530 Login incorrect.\r\n");
+        ftp_send_reply(s, ftp_reply_login_bad);
     }
 }
 
@@ -1269,12 +1331,9 @@ static void ftp_process_command(ftp_session_t *s)
         while (*arg == ' ') arg++;
     }
 
-    /* Uppercase the command for case-insensitive matching. */
-    for (char *p = cmd; *p; p++) *p = (char)toupper((unsigned char)*p);
-
     const struct ftp_cmd *c = NULL;
     for (size_t i = 0; i < sizeof(ftp_commands) / sizeof(ftp_commands[0]); i++) {
-        if (strcmp(cmd, ftp_commands[i].name) == 0) {
+        if (ftp_strcasecmp(cmd, ftp_commands[i].name) == 0) {
             c = &ftp_commands[i];
             break;
         }

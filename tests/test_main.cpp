@@ -647,6 +647,43 @@ TEST_CASE("DELE deletes a file or reports failure", "[fs]")
     }
 }
 
+TEST_CASE("an empty argument is not the current directory", "[fs][security]")
+{
+    /* Given a command line with a trailing space, the argument parses to ""
+     * rather than to no argument at all. Resolving "" yields the CWD, so
+     * `RMD ` used to delete the directory the client was sitting in and
+     * answer 250. An empty argument must be treated as a missing one. */
+    init_server();
+    Client c = connect_client();
+
+    static int s_removes;
+    s_removes = 0;
+    mock_lfs_remove_fn = [](lfs_t *, const char *) -> int { s_removes++; return 0; };
+
+    mock_lfs_stat_fn = stat_is_dir;
+    REQUIRE(send_cmd(c, "CWD /sub\r\n") == "250 Directory successfully changed.\r\n");
+
+    SECTION("RMD does not remove the working directory") {
+        REQUIRE(send_cmd(c, "RMD \r\n")   == "501 Specify directory name.\r\n");
+        REQUIRE(send_cmd(c, "RMD   \r\n") == "501 Specify directory name.\r\n");
+    }
+    SECTION("DELE does not remove the working directory") {
+        mock_lfs_stat_fn = stat_is_reg;
+        REQUIRE(send_cmd(c, "DELE \r\n") == "501 Specify file name.\r\n");
+    }
+    SECTION("every other path command reports the missing argument") {
+        for (const char *cmd : {"MKD \r\n", "RETR \r\n", "STOR \r\n",
+                                "SIZE \r\n", "RNFR \r\n", "RNTO \r\n"}) {
+            INFO("command: " << cmd);
+            REQUIRE(send_cmd(c, cmd).rfind("501 Specify", 0) == 0);
+        }
+    }
+
+    /* Nothing was unlinked, and the working directory still stands. */
+    REQUIRE(s_removes == 0);
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/sub\" is the current directory.\r\n");
+}
+
 TEST_CASE("RNFR / RNTO rename flow", "[fs]")
 {
     init_server();
@@ -1155,6 +1192,106 @@ TEST_CASE("a data connection reset aborts the transfer with 426", "[transfer]")
     REQUIRE(out == "426 Connection closed; transfer aborted.\r\n");
 
     /* The reset must not leave the session unable to transfer again. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("RETR reports a file-size failure rather than announcing it", "[transfer]")
+{
+    /* An unchecked lfs_file_size() error reaches the client as a negative
+     * byte count in the "150" reply. */
+    init_server();
+    Client c = connect_client();
+
+    static int s_closes;
+    s_closes = 0;
+    mock_lfs_file_close_fn = [](lfs_t *, lfs_file_t *) -> int { s_closes++; return 0; };
+    mock_lfs_file_size_fn  = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return -1; };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR file.bin\r\n") ==
+            "451 Requested action aborted: local error in processing.\r\n");
+
+    /* The file opened for the transfer must not be left dangling — a second
+     * open of the same handle corrupts littlefs's list of open files. */
+    REQUIRE(s_closes == 1);
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("ABOR reports the transfer it cut short", "[transfer]")
+{
+    init_server();
+    Client c = connect_client();
+
+    SECTION("with nothing running, only the 226 is sent") {
+        REQUIRE(send_cmd(c, "ABOR\r\n") == "226 ABOR command successful.\r\n");
+    }
+
+    SECTION("a transfer that never announced itself is dropped silently") {
+        /* Armed, but the data connection is not up, so no 150 went out and
+         * the client is not waiting on a completion reply. */
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "RETR a.txt\r\n").empty());
+        REQUIRE(send_cmd(c, "ABOR\r\n") == "226 ABOR command successful.\r\n");
+    }
+
+    SECTION("a live transfer gets its 426 before the 226") {
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+        accept_pasv_data_connection();   /* sends the "150" */
+        REQUIRE(send_cmd(c, "ABOR\r\n") ==
+                "426 Connection closed; transfer aborted.\r\n"
+                "226 ABOR command successful.\r\n");
+    }
+}
+
+TEST_CASE("a new PASV or PORT reports the transfer it supersedes", "[transfer]")
+{
+    /* Both commands drop the current data channel. Without the 426 the client
+     * is left waiting for a 226 that the superseded transfer will never send. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    accept_pasv_data_connection();
+
+    SECTION("PASV") {
+        std::string out = send_cmd(c, "PASV\r\n");
+        REQUIRE(out.rfind("426 Connection closed; transfer aborted.\r\n", 0) == 0);
+        REQUIRE(out.find("227 Entering Passive Mode") != std::string::npos);
+    }
+    SECTION("PORT") {
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") ==
+                "426 Connection closed; transfer aborted.\r\n"
+                "200 PORT command successful.\r\n");
+    }
+}
+
+TEST_CASE("an active-mode connect that fails reports 425, not 426", "[transfer]")
+{
+    /* lwIP reports a failed connect through the error callback rather than
+     * the connected callback. A connection that never opened is a 425; 426
+     * would tell the client a transfer died in flight. */
+    init_server();
+    Client c = connect_client();
+
+    static struct tcp_pcb *s_pcb;
+    s_pcb = nullptr;
+    mock_tcp_connect_fn = [](struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
+                             tcp_connected_fn) -> err_t { s_pcb = pcb; return ERR_OK; };
+
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+    REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty()); /* awaiting the connect */
+    mock_tcp_connect_fn = nullptr;
+
+    int idx = mock_tcp_pcb_index(s_pcb);
+    REQUIRE(idx >= 0);
+    REQUIRE(mock_tcp_cb_err[idx] != nullptr);
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_err[idx](mock_tcp_cb_arg[idx], ERR_RST);
+    REQUIRE(written_since(before) == "425 Can't open data connection.\r\n");
+
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
