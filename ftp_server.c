@@ -44,9 +44,8 @@ typedef enum {
     FTP_DATA_STOR,
 } ftp_data_mode_t;
 
-/** Session state machine. */
+/** Session state machine. WAIT_USER is 0, so a zeroed session is logged out. */
 typedef enum {
-    FTP_STATE_IDLE,          /**< waiting for commands */
     FTP_STATE_WAIT_USER,     /**< sent greeting, expect USER */
     FTP_STATE_WAIT_PASS,     /**< got USER, expect PASS */
     FTP_STATE_LOGGED_IN,     /**< authenticated, accept commands */
@@ -85,7 +84,7 @@ typedef struct ftp_session {
     /* Active mode target */
     ip_addr_t             port_addr;
 
-    /* RETR: name and size reported in the "150" reply */
+    /* RETR: size reported in the "150" reply */
     lfs_soff_t            retr_size;
 
     uint16_t              cmd_len;
@@ -100,9 +99,6 @@ typedef struct ftp_session {
 
     uint8_t               in_use;
 
-    /* Transfer type: 'A' (ASCII) or 'I' (binary) */
-    char                  type;
-
     uint8_t               port_active; /**< 1 = use active mode */
     uint8_t               file_open;
     uint8_t               dir_open;
@@ -110,9 +106,6 @@ typedef struct ftp_session {
     /* Active mode: data_pcb is set but tcp_connect() has not completed yet,
      * so it must not be treated as a usable data connection. */
     uint8_t               data_connecting;
-
-    /* STOR: flag that we are receiving data */
-    uint8_t               stor_active;
 
     /* Resynchronising after an over-long command line: everything up to
      * and including the next '\n' belongs to the discarded line. */
@@ -132,8 +125,6 @@ typedef struct ftp_session {
     /* Pending RNFR path (set by RNFR, consumed by RNTO) */
     char                  rnfr[FTP_SERVER_PATH_MAX];
 
-    char                  retr_name[FTP_SERVER_PATH_MAX];
-
     uint8_t               file_cache[FTP_SERVER_FILE_CACHE_SIZE];
 
     /* Transfer buffer */
@@ -148,6 +139,12 @@ static lfs_t             *s_lfs;
 static struct tcp_pcb    *s_listen_pcb;
 static ftp_session_t      s_sessions[FTP_SERVER_MAX_CLIENTS];
 static uint16_t           s_next_pasv_port = FTP_SERVER_PASV_PORT_MIN;
+
+/* Scratch for the handful of replies that have to be formatted. lwIP's raw
+ * API runs every callback on one thread, so a single shared buffer is safe
+ * and keeps FTP_SERVER_PATH_MAX-sized frames off the (scarce) MCU stack.
+ * Only valid until the ftp_send_reply() that consumes it returns. */
+static char               s_reply[FTP_SERVER_PATH_MAX + 64];
 
 /* Replies reused by several handlers — one copy in .rodata each. */
 static const char ftp_reply_need_file[] = "501 Specify file name.\r\n";
@@ -211,6 +208,10 @@ static int ftp_close_pcb(struct tcp_pcb **ppcb, int listener)
     }
 
     if (tcp_close(pcb) == ERR_OK) return 0;
+    /* tcp_close() cannot fail on a LISTEN pcb (it just unlinks and frees it),
+     * and tcp_abort() asserts "don't call tcp_abort for listen-pcbs" — so the
+     * fallback below is for connected PCBs only. */
+    if (listener) return 0;
     tcp_abort(pcb);
     return 1;
 }
@@ -323,9 +324,9 @@ static ftp_session_t *ftp_alloc_session(void)
             ftp_session_t *s = &s_sessions[i];
             memset(s, 0, sizeof(*s));
             s->in_use = 1;
-            /* Only binary transfers are implemented, so default to 'I'
-             * rather than advertising a mode TYPE would reject. */
-            s->type   = 'I';
+            /* The rest of file_cfg stays zeroed for the session's lifetime;
+             * only the no-heap cache buffer has to be pointed at. */
+            s->file_cfg.buffer = s->file_cache;
             strcpy(s->cwd, "/");
             return s;
         }
@@ -384,7 +385,6 @@ static void ftp_close_data(ftp_session_t *s)
     s->data_mode    = FTP_DATA_IDLE;
     s->data_pending = 0;
     s->data_offset  = 0;
-    s->stor_active  = 0;
     /* RFC 959: PORT/PASV should be re-issued per transfer. Resetting here
      * is intentionally strict; some clients assume the last PORT persists.
      * If relaxed, also clear port_active in the PASV handler (already done)
@@ -424,9 +424,12 @@ static int ftp_transfer_busy(ftp_session_t *s)
 
 /**
  * Attempt to flush all pending bytes in data_buf[data_offset..) to the
- * data PCB. Returns 1 if fully flushed (data_pending == 0), or 0 if
- * blocked on send buffer space / a tcp_write error — the caller must
- * return and wait for the next tcp_sent or poll callback.
+ * data PCB.
+ *
+ * @return 1 when fully flushed (data_pending == 0);
+ *         0 when blocked on send buffer space — the caller must return and
+ *           wait for the next tcp_sent or poll callback;
+ *        -1 when the connection cannot carry the data at all.
  */
 static int ftp_send_pending(ftp_session_t *s)
 {
@@ -436,7 +439,12 @@ static int ftp_send_pending(ftp_session_t *s)
         uint16_t to_send = (s->data_pending < space) ? s->data_pending : space;
         err_t err = tcp_write(s->data_pcb, s->data_buf + s->data_offset,
                               to_send, TCP_WRITE_FLAG_COPY);
-        if (err != ERR_OK) return 0; /* back-pressure */
+        /* ERR_MEM is transient back-pressure and the sent callback will retry;
+         * anything else (ERR_CONN, ERR_ARG, ...) never resolves on its own, and
+         * treating it as back-pressure would hang the transfer until the idle
+         * timer fires. */
+        if (err == ERR_MEM) return 0;
+        if (err != ERR_OK)  return -1;
         tcp_output(s->data_pcb);
         s->data_offset  += to_send;
         s->data_pending -= to_send;
@@ -508,11 +516,17 @@ static void ftp_send_next_data(ftp_session_t *s)
 {
     if (!s->data_pcb) return;
 
-    /* If we have pending bytes from a previous fill, try to send them first. */
-    if (!ftp_send_pending(s)) return;
-
-    /* Fill and send subsequent chunks until the transfer is exhausted. */
     for (;;) {
+        /* Flush what is already buffered — leftovers from a previous fill on
+         * the first pass, the chunk just filled on later ones. */
+        int flushed = ftp_send_pending(s);
+        if (flushed == 0) return;   /* wait for tcp_sent */
+        if (flushed < 0) {
+            ftp_close_data(s);
+            ftp_send_reply(s, "426 Connection closed; transfer aborted.\r\n");
+            return;
+        }
+
         int n = ftp_fill_next_chunk(s);
         if (n < 0) {
             ftp_close_data(s);
@@ -524,7 +538,6 @@ static void ftp_send_next_data(ftp_session_t *s)
 
         s->data_offset  = 0;
         s->data_pending = (uint16_t)n;
-        if (!ftp_send_pending(s)) return;
     }
 }
 
@@ -576,15 +589,14 @@ static void ftp_start_transfer(ftp_session_t *s)
     if (!s->data_pcb) return;
 
     if (s->data_mode == FTP_DATA_STOR) {
-        s->stor_active = 1;
         ftp_send_reply(s, "150 Ok to send data.\r\n");
     } else if (s->data_mode == FTP_DATA_RETR) {
-        char reply[FTP_SERVER_PATH_MAX + 96];
-        (void)snprintf(reply, sizeof(reply),
-                 "150 Opening %s mode data connection for %s (%ld bytes).\r\n",
-                 (s->type == 'I') ? "BINARY" : "ASCII",
-                 s->retr_name, (long)s->retr_size);
-        ftp_send_reply(s, reply);
+        /* Only binary transfers are implemented (TYPE rejects anything else),
+         * so the mode is a constant. Clients that care parse the byte count. */
+        (void)snprintf(s_reply, sizeof(s_reply),
+                 "150 Opening BINARY mode data connection (%ld bytes).\r\n",
+                 (long)s->retr_size);
+        ftp_send_reply(s, s_reply);
         ftp_send_next_data(s);
     } else {
         ftp_send_reply(s, "150 Here comes the data.\r\n");
@@ -659,6 +671,10 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_ABRT;
     }
 
+    /* Tell lwIP the backlog slot is free again; without this a build with
+     * TCP_LISTEN_BACKLOG enabled stops accepting after `backlog` connections. */
+    tcp_accepted(s->pasv_listen_pcb);
+
     s->data_aborted = 0;
     s->data_pcb = pcb;
     tcp_arg(pcb, s);
@@ -690,9 +706,16 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     s->idle_polls = 0;
 
     if (!p) {
-        /* Client closed data connection — end of upload. */
+        /* Client closed the data connection. For an upload that is how the
+         * transfer ends; for a download it means the client gave up partway,
+         * and answering 226 would report a truncated file as complete. */
+        ftp_data_mode_t mode = s->data_mode;
         ftp_close_data(s);
-        ftp_send_reply(s, "226 Transfer complete.\r\n");
+        if (mode == FTP_DATA_STOR) {
+            ftp_send_reply(s, "226 Transfer complete.\r\n");
+        } else if (mode != FTP_DATA_IDLE) {
+            ftp_send_reply(s, "426 Connection closed; transfer aborted.\r\n");
+        }
         return s->data_aborted ? ERR_ABRT : ERR_OK;
     }
 
@@ -759,13 +782,17 @@ static void ftp_data_err(void *arg, err_t err)
 /*  Command processing                                                */
 /* ------------------------------------------------------------------ */
 
-/** Signature for a post-auth command handler. */
+/** Signature for a command handler. */
 typedef void (*ftp_cmd_fn)(ftp_session_t *s, const char *arg);
 
-/** One entry in the post-auth command dispatch table. */
+/** One entry in the command dispatch table. */
 struct ftp_cmd {
-    const char *name;
-    ftp_cmd_fn  handler;
+    /* Inline rather than a pointer: every FTP verb fits, and it saves a
+     * pointer plus a relocation per entry in the image. */
+    char       name[5];
+    uint8_t    pre_auth   : 1;  /**< accepted before login */
+    uint8_t    keeps_rnfr : 1;  /**< does not cancel a pending RNFR */
+    ftp_cmd_fn handler;
 };
 
 static void cmd_syst(ftp_session_t *s, const char *arg)
@@ -808,7 +835,6 @@ static void cmd_noop(ftp_session_t *s, const char *arg)
 static void cmd_type(ftp_session_t *s, const char *arg)
 {
     if (arg && (arg[0] == 'I' || arg[0] == 'i')) {
-        s->type = 'I';
         ftp_send_reply(s, "200 Switching to Binary mode.\r\n");
     } else {
         ftp_send_reply(s, "504 ASCII transfer mode not supported, use binary.\r\n");
@@ -818,10 +844,9 @@ static void cmd_type(ftp_session_t *s, const char *arg)
 static void cmd_pwd(ftp_session_t *s, const char *arg)
 {
     (void)arg;
-    char reply[FTP_SERVER_PATH_MAX + 64];
-    (void)snprintf(reply, sizeof(reply), "257 \"%s\" is the current directory.\r\n",
-             s->cwd);
-    ftp_send_reply(s, reply);
+    (void)snprintf(s_reply, sizeof(s_reply),
+             "257 \"%s\" is the current directory.\r\n", s->cwd);
+    ftp_send_reply(s, s_reply);
 }
 
 /** Adopt @p path as the session CWD and confirm it. */
@@ -905,12 +930,11 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     uint32_t ip4 = ip_addr_get_ip4_u32(&local_ip);
     uint8_t *ip  = (uint8_t *)&ip4;
 
-    char reply[FTP_SERVER_PATH_MAX + 64];
-    (void)snprintf(reply, sizeof(reply),
+    (void)snprintf(s_reply, sizeof(s_reply),
              "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u).\r\n",
              ip[0], ip[1], ip[2], ip[3],
              (unsigned)(port >> 8), (unsigned)(port & 0xff));
-    ftp_send_reply(s, reply);
+    ftp_send_reply(s, s_reply);
 }
 
 static void cmd_port(ftp_session_t *s, const char *arg)
@@ -965,10 +989,9 @@ static void ftp_do_list(ftp_session_t *s, const char *arg, ftp_data_mode_t mode)
 
     char path[FTP_SERVER_PATH_MAX];
 
-    /* Skip common options like -la, -a, etc. */
+    /* Skip ls-style options ("-la", "-l -a", ...); whatever follows is a path. */
     const char *list_arg = arg;
-    if (list_arg && list_arg[0] == '-') {
-        /* Skip past the option */
+    while (list_arg && list_arg[0] == '-') {
         while (*list_arg && *list_arg != ' ') list_arg++;
         while (*list_arg == ' ') list_arg++;
         if (*list_arg == '\0') list_arg = NULL;
@@ -996,45 +1019,44 @@ static void cmd_nlst(ftp_session_t *s, const char *arg)
     ftp_do_list(s, arg, FTP_DATA_NLST);
 }
 
-static void cmd_retr(ftp_session_t *s, const char *arg)
+/**
+ * Shared RETR / STOR setup: resolve @p arg, open s->file with the session's
+ * static cache and arm @p mode. Replies on failure so the caller can return.
+ *
+ * @return 0 on success, -1 after a reply has been sent.
+ */
+static int ftp_open_transfer(ftp_session_t *s, const char *arg,
+                             ftp_data_mode_t mode, int flags,
+                             const char *fail_msg)
 {
-    if (ftp_transfer_busy(s)) return;
+    if (ftp_transfer_busy(s)) return -1;
 
     char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return;
+    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return -1;
 
-    memset(&s->file_cfg, 0, sizeof(s->file_cfg));
-    s->file_cfg.buffer = s->file_cache;
-    if (lfs_file_opencfg(s_lfs, &s->file, path,
-                         LFS_O_RDONLY, &s->file_cfg) < 0) {
-        ftp_send_reply(s, "550 Failed to open file.\r\n");
-        return;
+    if (lfs_file_opencfg(s_lfs, &s->file, path, flags, &s->file_cfg) < 0) {
+        ftp_send_reply(s, fail_msg);
+        return -1;
     }
     s->file_open = 1;
-    s->data_mode = FTP_DATA_RETR;
-    s->retr_size = lfs_file_size(s_lfs, &s->file);
-    ftp_strlcpy(s->retr_name, arg, sizeof(s->retr_name));
+    s->data_mode = mode;
+    return 0;
+}
 
+static void cmd_retr(ftp_session_t *s, const char *arg)
+{
+    if (ftp_open_transfer(s, arg, FTP_DATA_RETR, LFS_O_RDONLY,
+                          "550 Failed to open file.\r\n") < 0) return;
+
+    s->retr_size = lfs_file_size(s_lfs, &s->file);
     ftp_begin_transfer(s);
 }
 
 static void cmd_stor(ftp_session_t *s, const char *arg)
 {
-    if (ftp_transfer_busy(s)) return;
-
-    char path[FTP_SERVER_PATH_MAX];
-    if (ftp_arg_path(s, arg, path, ftp_reply_need_file) < 0) return;
-
-    memset(&s->file_cfg, 0, sizeof(s->file_cfg));
-    s->file_cfg.buffer = s->file_cache;
-    if (lfs_file_opencfg(s_lfs, &s->file, path,
-                         LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC,
-                         &s->file_cfg) < 0) {
-        ftp_send_reply(s, "550 Failed to create file.\r\n");
-        return;
-    }
-    s->file_open = 1;
-    s->data_mode = FTP_DATA_STOR;
+    if (ftp_open_transfer(s, arg, FTP_DATA_STOR,
+                          LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC,
+                          "550 Failed to create file.\r\n") < 0) return;
 
     ftp_begin_transfer(s);
 }
@@ -1083,9 +1105,8 @@ static void cmd_mkd(ftp_session_t *s, const char *arg)
         ftp_send_reply(s, "550 Create directory failed.\r\n");
         return;
     }
-    char reply[FTP_SERVER_PATH_MAX + 64];
-    (void)snprintf(reply, sizeof(reply), "257 \"%s\" created.\r\n", path);
-    ftp_send_reply(s, reply);
+    (void)snprintf(s_reply, sizeof(s_reply), "257 \"%s\" created.\r\n", path);
+    ftp_send_reply(s, s_reply);
 }
 
 static void cmd_rnfr(ftp_session_t *s, const char *arg)
@@ -1130,10 +1151,9 @@ static void cmd_size(ftp_session_t *s, const char *arg)
         ftp_send_reply(s, "550 Could not get file size.\r\n");
         return;
     }
-    char reply[FTP_SERVER_PATH_MAX + 64];
-    (void)snprintf(reply, sizeof(reply), "213 %lu\r\n",
+    (void)snprintf(s_reply, sizeof(s_reply), "213 %lu\r\n",
              (unsigned long)info.size);
-    ftp_send_reply(s, reply);
+    ftp_send_reply(s, s_reply);
 }
 
 static void cmd_abor(ftp_session_t *s, const char *arg)
@@ -1143,35 +1163,87 @@ static void cmd_abor(ftp_session_t *s, const char *arg)
     ftp_send_reply(s, "226 ABOR command successful.\r\n");
 }
 
-/** Post-auth command dispatch table. */
+static void cmd_user(ftp_session_t *s, const char *arg)
+{
+    const char *need_user = FTP_SERVER_USER;
+    const char *need_pass = FTP_SERVER_PASS;
+
+    if (need_user != NULL && (!arg || strcmp(arg, need_user) != 0)) {
+        ftp_send_reply(s, "530 Login incorrect.\r\n");
+        return;
+    }
+    if (need_user != NULL && need_pass != NULL) {
+        s->auth = FTP_STATE_WAIT_PASS;
+        ftp_send_reply(s, "331 Please specify the password.\r\n");
+        return;
+    }
+    s->auth = FTP_STATE_LOGGED_IN;
+    ftp_send_reply(s, "230 Login successful.\r\n");
+}
+
+static void cmd_pass(ftp_session_t *s, const char *arg)
+{
+    if (s->auth != FTP_STATE_WAIT_PASS) {
+        ftp_send_reply(s, "503 Login with USER first.\r\n");
+        return;
+    }
+    /* FTP_STATE_WAIT_PASS is only ever entered when FTP_SERVER_PASS is
+     * non-NULL, so a NULL here can only mean a corrupt state. */
+    const char *need_pass = FTP_SERVER_PASS;
+    if (need_pass != NULL && arg && strcmp(arg, need_pass) == 0) {
+        s->auth = FTP_STATE_LOGGED_IN;
+        ftp_send_reply(s, "230 Login successful.\r\n");
+    } else {
+        s->auth = FTP_STATE_WAIT_USER;
+        ftp_send_reply(s, "530 Login incorrect.\r\n");
+    }
+}
+
+static void cmd_quit(ftp_session_t *s, const char *arg)
+{
+    (void)arg;
+    ftp_send_reply(s, "221 Goodbye.\r\n");
+    ftp_close_session(s);
+}
+
+/**
+ * Command dispatch table.
+ *
+ * `pre_auth` marks the three commands accepted before login; `keeps_rnfr`
+ * marks the pair that may leave a pending rename intact (RFC 959: RNTO must
+ * directly follow RNFR, anything else cancels it).
+ */
 static const struct ftp_cmd ftp_commands[] = {
-    {"SYST", cmd_syst},
-    {"FEAT", cmd_feat},
-    {"OPTS", cmd_opts},
-    {"NOOP", cmd_noop},
-    {"TYPE", cmd_type},
-    {"PWD",  cmd_pwd},
-    {"XPWD", cmd_pwd},
-    {"CWD",  cmd_cwd},
-    {"XCWD", cmd_cwd},
-    {"CDUP", cmd_cdup},
-    {"XCUP", cmd_cdup},
-    {"PASV", cmd_pasv},
-    {"PORT", cmd_port},
-    {"LIST", cmd_list},
-    {"NLST", cmd_nlst},
-    {"RETR", cmd_retr},
-    {"STOR", cmd_stor},
-    {"DELE", cmd_dele},
-    {"MKD",  cmd_mkd},
-    {"XMKD", cmd_mkd},
-    {"RMD",  cmd_rmd},
-    {"XRMD", cmd_rmd},
-    {"RNFR", cmd_rnfr},
-    {"RNTO", cmd_rnto},
-    {"SIZE", cmd_size},
-    {"ABOR", cmd_abor},
-    {NULL,   NULL},
+    /*  name    pre  rnfr  handler   */
+    {"USER",     1,   0,   cmd_user},
+    {"PASS",     1,   0,   cmd_pass},
+    {"QUIT",     1,   0,   cmd_quit},
+    {"SYST",     0,   0,   cmd_syst},
+    {"FEAT",     0,   0,   cmd_feat},
+    {"OPTS",     0,   0,   cmd_opts},
+    {"NOOP",     0,   0,   cmd_noop},
+    {"TYPE",     0,   0,   cmd_type},
+    {"PWD",      0,   0,   cmd_pwd},
+    {"XPWD",     0,   0,   cmd_pwd},
+    {"CWD",      0,   0,   cmd_cwd},
+    {"XCWD",     0,   0,   cmd_cwd},
+    {"CDUP",     0,   0,   cmd_cdup},
+    {"XCUP",     0,   0,   cmd_cdup},
+    {"PASV",     0,   0,   cmd_pasv},
+    {"PORT",     0,   0,   cmd_port},
+    {"LIST",     0,   0,   cmd_list},
+    {"NLST",     0,   0,   cmd_nlst},
+    {"RETR",     0,   0,   cmd_retr},
+    {"STOR",     0,   0,   cmd_stor},
+    {"DELE",     0,   0,   cmd_dele},
+    {"MKD",      0,   0,   cmd_mkd},
+    {"XMKD",     0,   0,   cmd_mkd},
+    {"RMD",      0,   0,   cmd_rmd},
+    {"XRMD",     0,   0,   cmd_rmd},
+    {"RNFR",     0,   1,   cmd_rnfr},
+    {"RNTO",     0,   1,   cmd_rnto},
+    {"SIZE",     0,   0,   cmd_size},
+    {"ABOR",     0,   0,   cmd_abor},
 };
 
 /**
@@ -1200,90 +1272,87 @@ static void ftp_process_command(ftp_session_t *s)
     /* Uppercase the command for case-insensitive matching. */
     for (char *p = cmd; *p; p++) *p = (char)toupper((unsigned char)*p);
 
-    /* -------------------------------------------------------------- */
-    /*  Commands allowed before authentication                        */
-    /* -------------------------------------------------------------- */
-
-    if (strcmp(cmd, "USER") == 0) {
-        const char *need_user = FTP_SERVER_USER;
-        if (need_user == NULL) {
-            /* No auth required. */
-            s->auth = FTP_STATE_LOGGED_IN;
-            ftp_send_reply(s, "230 Login successful.\r\n");
-        } else {
-            if (arg && strcmp(arg, need_user) == 0) {
-                const char *need_pass = FTP_SERVER_PASS;
-                if (need_pass == NULL) {
-                    s->auth = FTP_STATE_LOGGED_IN;
-                    ftp_send_reply(s, "230 Login successful.\r\n");
-                } else {
-                    s->auth = FTP_STATE_WAIT_PASS;
-                    ftp_send_reply(s, "331 Please specify the password.\r\n");
-                }
-            } else {
-                ftp_send_reply(s, "530 Login incorrect.\r\n");
-            }
+    const struct ftp_cmd *c = NULL;
+    for (size_t i = 0; i < sizeof(ftp_commands) / sizeof(ftp_commands[0]); i++) {
+        if (strcmp(cmd, ftp_commands[i].name) == 0) {
+            c = &ftp_commands[i];
+            break;
         }
-        return;
     }
 
-    if (strcmp(cmd, "PASS") == 0) {
-        if (s->auth != FTP_STATE_WAIT_PASS) {
-            ftp_send_reply(s, "503 Login with USER first.\r\n");
-            return;
-        }
-        /* FTP_STATE_WAIT_PASS is only ever entered when FTP_SERVER_PASS is
-         * non-NULL, so a NULL here can only mean a corrupt state. */
-        const char *need_pass = FTP_SERVER_PASS;
-        if (need_pass != NULL && arg && strcmp(arg, need_pass) == 0) {
-            s->auth = FTP_STATE_LOGGED_IN;
-            ftp_send_reply(s, "230 Login successful.\r\n");
-        } else {
-            s->auth = FTP_STATE_WAIT_USER;
-            ftp_send_reply(s, "530 Login incorrect.\r\n");
-        }
+    if (c && c->pre_auth) {
+        c->handler(s, arg);
         return;
     }
-
-    if (strcmp(cmd, "QUIT") == 0) {
-        ftp_send_reply(s, "221 Goodbye.\r\n");
-        ftp_close_session(s);
-        return;
-    }
-
-    /* All other commands require authentication. */
     if (s->auth != FTP_STATE_LOGGED_IN) {
         ftp_send_reply(s, "530 Please login with USER and PASS.\r\n");
         return;
     }
-
-    /* RFC 959: RNTO must directly follow RNFR — anything in between
-     * cancels the pending rename. */
-    if (strcmp(cmd, "RNFR") != 0 && strcmp(cmd, "RNTO") != 0) {
+    if (!c || !c->keeps_rnfr) {
         s->rnfr[0] = '\0';
     }
-
-    /* -------------------------------------------------------------- */
-    /*  Post-auth commands — dispatch table                           */
-    /* -------------------------------------------------------------- */
-
-    for (const struct ftp_cmd *c = ftp_commands; c->name; c++) {
-        if (strcmp(cmd, c->name) == 0) {
-            c->handler(s, arg);
-            return;
-        }
+    if (!c) {
+        ftp_send_reply(s, "502 Command not implemented.\r\n");
+        return;
     }
-
-    /* -------------------------------------------------------------- */
-    /*  Unknown command                                               */
-    /* -------------------------------------------------------------- */
-
-    ftp_send_reply(s, "502 Command not implemented.\r\n");
+    c->handler(s, arg);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Control connection callbacks                                      */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Dispatch every complete line currently in cmd_buf, leaving any trailing
+ * partial line at the front of the buffer.
+ *
+ * @return 0 if the session was torn down (the caller must stop touching it
+ *         and hand ERR_ABRT/ERR_OK back to lwIP), 1 otherwise.
+ */
+static int ftp_consume_lines(ftp_session_t *s)
+{
+    while (s->cmd_len > 0) {
+        char *nl = (char *)memchr(s->cmd_buf, '\n', s->cmd_len);
+        if (!nl) {
+            /* Partial line: normally wait for more data, but while
+             * resynchronising it is all tail of the discarded line. */
+            if (s->discard_line) s->cmd_len = 0;
+            return 1;
+        }
+
+        uint16_t line_len  = (uint16_t)(nl - s->cmd_buf + 1);
+        uint16_t total_len = s->cmd_len;
+
+        if (s->discard_line) {
+            /* Tail of an over-long command line — drop through to the shift
+             * below, which resynchronises on the next line. */
+            s->discard_line = 0;
+        } else {
+            /* ftp_process_command() writes a NUL at cmd_buf[line_len]; when
+             * more data follows in the buffer (pipelined commands in one TCP
+             * segment) that byte belongs to the next queued line, so it must
+             * be preserved and restored instead of permanently clobbered. */
+            uint8_t has_next  = (line_len < total_len);
+            char    next_byte = (char)(has_next ? s->cmd_buf[line_len] : '\0');
+
+            s->cmd_len = line_len;
+            ftp_process_command(s);
+
+            /* Session may have been freed by QUIT or an undeliverable reply. */
+            if (!s->in_use) return 0;
+
+            if (has_next) s->cmd_buf[line_len] = next_byte;
+        }
+
+        /* Shift remaining bytes to the front of the buffer. */
+        uint16_t remaining = (uint16_t)(total_len - line_len);
+        if (remaining > 0) {
+            memmove(s->cmd_buf, s->cmd_buf + line_len, remaining);
+        }
+        s->cmd_len = remaining;
+    }
+    return 1;
+}
 
 static err_t ftp_ctrl_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
@@ -1305,71 +1374,37 @@ static err_t ftp_ctrl_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* Reset idle timeout on any received data. */
     s->idle_polls = 0;
 
-    /* Append the entire pbuf payload into the command buffer. */
     uint16_t total = p->tot_len;
-    uint16_t room  = (uint16_t)(FTP_SERVER_CMD_BUF_SIZE - 1 - s->cmd_len);
-    uint16_t copy  = (total < room) ? total : room;
-
-    if (copy > 0) {
-        pbuf_copy_partial(p, s->cmd_buf + s->cmd_len, copy, 0);
-        s->cmd_len += copy;
-    }
-
     tcp_recved(pcb, total);
+
+    /* Feed the segment through the command buffer in buffer-sized bites.
+     * Copying only what currently fits and dropping the rest would throw away
+     * the '\n' that ends an over-long line — and with it whatever pipelined
+     * commands followed it — so the segment is consumed in full instead. */
+    for (uint16_t consumed = 0; consumed < total; ) {
+        uint16_t room  = (uint16_t)(FTP_SERVER_CMD_BUF_SIZE - 1 - s->cmd_len);
+        uint16_t chunk = (uint16_t)(total - consumed);
+        if (chunk > room) chunk = room;
+
+        pbuf_copy_partial(p, s->cmd_buf + s->cmd_len, chunk, consumed);
+        s->cmd_len = (uint16_t)(s->cmd_len + chunk);
+        consumed   = (uint16_t)(consumed + chunk);
+
+        /* A complete line ends with '\n'; one segment may hold several. */
+        if (!ftp_consume_lines(s)) break;
+
+        /* Buffer full without a complete line: discard it and skip everything
+         * up to the next '\n' — which may still be in this very segment — so
+         * the tail of the over-long line is not mistaken for a fresh command. */
+        if (s->cmd_len >= FTP_SERVER_CMD_BUF_SIZE - 1) {
+            s->cmd_len      = 0;
+            s->discard_line = 1;
+            ftp_send_reply(s, "500 Command line too long.\r\n");
+            if (!s->in_use) break;
+        }
+    }
+
     pbuf_free(p);
-
-    /* Process all complete lines in the buffer. A complete line ends with
-     * '\n'.  We may have multiple commands in one TCP segment. */
-    while (s->cmd_len > 0) {
-        char *nl = (char *)memchr(s->cmd_buf, '\n', s->cmd_len);
-        if (!nl) {
-            /* Partial line: normally wait for more data, but while
-             * resynchronising it is all tail of the discarded line. */
-            if (s->discard_line) s->cmd_len = 0;
-            break;
-        }
-
-        uint16_t line_len  = (uint16_t)(nl - s->cmd_buf + 1);
-        uint16_t total_len = s->cmd_len;
-
-        if (s->discard_line) {
-            /* Tail of an over-long command line — drop through to the shift
-             * below, which resynchronises on the next line. */
-            s->discard_line = 0;
-        } else {
-            /* ftp_process_command() writes a NUL at cmd_buf[line_len]; when
-             * more data follows in the buffer (pipelined commands in one TCP
-             * segment) that byte belongs to the next queued line, so it must
-             * be preserved and restored instead of permanently clobbered. */
-            uint8_t has_next  = (line_len < total_len);
-            char    next_byte = (char)(has_next ? s->cmd_buf[line_len] : '\0');
-
-            s->cmd_len = line_len;
-            ftp_process_command(s);
-
-            /* Session may have been freed by QUIT. */
-            if (!s->in_use) return s->ctrl_aborted ? ERR_ABRT : ERR_OK;
-
-            if (has_next) s->cmd_buf[line_len] = next_byte;
-        }
-
-        /* Shift remaining bytes to the front of the buffer. */
-        uint16_t remaining = (uint16_t)(total_len - line_len);
-        if (remaining > 0) {
-            memmove(s->cmd_buf, s->cmd_buf + line_len, remaining);
-        }
-        s->cmd_len = remaining;
-    }
-
-    /* Buffer full without a complete line: discard it and skip everything up
-     * to the next '\n', so the tail of the over-long line is not mistaken for
-     * a fresh command. */
-    if (s->cmd_len >= FTP_SERVER_CMD_BUF_SIZE - 1) {
-        s->cmd_len      = 0;
-        s->discard_line = 1;
-        ftp_send_reply(s, "500 Command line too long.\r\n");
-    }
-
     return s->ctrl_aborted ? ERR_ABRT : ERR_OK;
 }
 
@@ -1411,6 +1446,10 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
 {
     (void)arg;
     if (err != ERR_OK || !pcb) return ERR_VAL;
+
+    /* Release the listener's backlog slot; a build with TCP_LISTEN_BACKLOG
+     * enabled otherwise stops accepting after `backlog` connections. */
+    tcp_accepted(s_listen_pcb);
 
     ftp_session_t *s = ftp_alloc_session();
     if (!s) {

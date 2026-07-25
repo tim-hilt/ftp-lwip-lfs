@@ -70,6 +70,13 @@ err_t tcp_bind   (struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port);
 struct tcp_pcb *tcp_listen_with_backlog(struct tcp_pcb *pcb, u8_t backlog);
 #define tcp_listen(pcb) tcp_listen_with_backlog((pcb), TCP_DEFAULT_LISTEN_BACKLOG)
 
+/**
+ * Real lwIP defines this as a macro over the *listening* PCB that gives the
+ * backlog slot back. The mock makes it a function so tests can observe that
+ * every accept callback honours the contract.
+ */
+void tcp_accepted(struct tcp_pcb *lpcb);
+
 err_t tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr,
                   u16_t port, tcp_connected_fn connected);
 

@@ -679,6 +679,14 @@ TEST_CASE("RNFR / RNTO rename flow", "[fs]")
         REQUIRE(send_cmd(c, "RNTO b.txt\r\n") == "503 RNFR required first.\r\n");
     }
 
+    SECTION("an intervening *unknown* command cancels it too") {
+        /* A command with no dispatch entry still passed through the auth
+         * gate, so it counts as "something happened in between". */
+        REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
+        REQUIRE(send_cmd(c, "FROB\r\n") == "502 Command not implemented.\r\n");
+        REQUIRE(send_cmd(c, "RNTO b.txt\r\n") == "503 RNFR required first.\r\n");
+    }
+
     SECTION("RNFR rejects a missing argument") {
         REQUIRE(send_cmd(c, "RNFR\r\n") == "501 Specify file name.\r\n");
     }
@@ -920,6 +928,17 @@ TEST_CASE("LIST strips ls-style option arguments", "[transfer]")
         REQUIRE(send_cmd(c, "LIST -la sub\r\n").empty());
         REQUIRE(s_opened == "/sub");
     }
+    SECTION("several separate options are all skipped") {
+        /* Stopping after the first option would treat "-a" as a path. */
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "LIST -l -a sub\r\n").empty());
+        REQUIRE(s_opened == "/sub");
+    }
+    SECTION("options with no path still list the current directory") {
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "LIST -l -a\r\n").empty());
+        REQUIRE(s_opened == "/");
+    }
 }
 
 TEST_CASE("LIST fails when directory cannot be opened", "[transfer]")
@@ -1051,8 +1070,9 @@ TEST_CASE("RETR sends file content over the data connection", "[transfer]")
     accept_pasv_data_connection();
     std::string out = written_since(before);
 
-    /* Only binary transfers are implemented, so a session defaults to 'I'. */
-    REQUIRE(out.rfind("150 Opening BINARY mode data connection for file.txt (11 bytes).\r\n", 0) == 0);
+    /* Only binary transfers are implemented, so the mode is always BINARY.
+     * The byte count matters — clients use it for progress reporting. */
+    REQUIRE(out.rfind("150 Opening BINARY mode data connection (11 bytes).\r\n", 0) == 0);
     REQUIRE(out.find("hello world") != std::string::npos);
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
 }
@@ -1745,4 +1765,206 @@ TEST_CASE("PASV fails cleanly when the local address is unavailable", "[pasv]")
 
     /* The half-built listener was torn down with it. */
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+/* ==================================================================== */
+/*  Regression: data-channel teardown and lwIP contract                 */
+/* ==================================================================== */
+
+namespace {
+
+/* Set up a RETR that is stuck mid-file: the data socket takes only the first
+ * five bytes of an eleven-byte file, so the transfer is still armed and the
+ * data PCB still live when the test does something to it. */
+struct StalledRetr {
+    Client          ctrl;
+    struct tcp_pcb *data_pcb;
+    int             data_idx;
+};
+
+StalledRetr start_stalled_retr()
+{
+    StalledRetr r{};
+    r.ctrl = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
+    g_retr_text = "hello world";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    REQUIRE(send_cmd(r.ctrl, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(r.ctrl, "RETR file.txt\r\n").empty());
+
+    mock_tcp_track_sndbuf = 1;
+    r.data_pcb = accept_pasv_data_connection(/*snd_buf=*/5);
+    r.data_idx = mock_tcp_pcb_index(r.data_pcb);
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("a download the client abandons is reported as aborted, not complete",
+          "[transfer]")
+{
+    /* Given a RETR that has only delivered part of the file ... */
+    init_server();
+    StalledRetr r = start_stalled_retr();
+    mock_tcp_track_sndbuf = 0;
+
+    /* When the client closes the data connection instead of reading on ... */
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[r.data_idx](mock_tcp_cb_arg[r.data_idx], r.data_pcb,
+                                 nullptr, ERR_OK);
+
+    /* Then it must not be told the (truncated) file arrived intact. */
+    REQUIRE(written_since(before) == "426 Connection closed; transfer aborted.\r\n");
+
+    /* And the session is reusable. */
+    REQUIRE(send_cmd(r.ctrl, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("an upload the client closes is still reported as complete",
+          "[transfer]")
+{
+    /* The counterpart to the case above: for STOR the FIN *is* the end of
+     * the transfer, so it must keep answering 226. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+}
+
+TEST_CASE("closing an idle data connection reports nothing", "[transfer]")
+{
+    /* No transfer was ever armed, so there is no transfer to report on —
+     * neither a 226 nor a 426 belongs on the control channel here. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+    REQUIRE(mock_tcp_write_len == before);
+}
+
+namespace {
+
+struct tcp_pcb *g_dead_data_pcb;
+
+/** tcp_write that fails permanently for one PCB and captures the rest. */
+err_t write_fails_on_dead_pcb(struct tcp_pcb *pcb, const void *data,
+                              u16_t len, u8_t)
+{
+    if (pcb == g_dead_data_pcb) return ERR_CONN;
+    u16_t room = (u16_t)(MOCK_TCP_WRITE_CAPTURE_SIZE - mock_tcp_write_len);
+    u16_t copy = (len < room) ? len : room;
+    std::memcpy(mock_tcp_write_buf + mock_tcp_write_len, data, copy);
+    mock_tcp_write_len = (u16_t)(mock_tcp_write_len + copy);
+    return ERR_OK;
+}
+
+} // namespace
+
+TEST_CASE("a permanently failing data write aborts instead of hanging",
+          "[transfer]")
+{
+    /* Given a stalled RETR whose data socket has gone bad ... */
+    init_server();
+    StalledRetr r = start_stalled_retr();
+
+    g_dead_data_pcb   = r.data_pcb;
+    mock_tcp_write_fn = write_fails_on_dead_pcb;
+
+    /* When the peer ACKs and lwIP asks for more data, but every write fails
+     * with an error that will never clear (ERR_MEM would be back-pressure) ... */
+    mock_tcp_ack(r.data_pcb, 64);
+    u16_t before = mock_tcp_write_len;
+    err_t err = mock_tcp_cb_sent[r.data_idx](mock_tcp_cb_arg[r.data_idx],
+                                             r.data_pcb, 5);
+
+    mock_tcp_write_fn     = nullptr;
+    mock_tcp_track_sndbuf = 0;
+    g_dead_data_pcb       = nullptr;
+
+    /* Then the transfer is torn down at once rather than waiting for a
+     * tcp_sent callback that will never come. */
+    REQUIRE(err == ERR_OK);
+    REQUIRE(written_since(before) == "426 Connection closed; transfer aborted.\r\n");
+    REQUIRE(send_cmd(r.ctrl, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("a command pipelined behind an over-long line still runs",
+          "[commands]")
+{
+    /* Given one segment holding a line that overflows the command buffer,
+     * its terminator, and a second complete command ... */
+    init_server();
+    Client c = connect_client();
+
+    std::string segment(FTP_SERVER_CMD_BUF_SIZE + 32, 'A');
+    segment += "\r\nNOOP\r\n";
+
+    /* When it is delivered in a single recv ... */
+    std::string out = send_cmd(c, segment);
+
+    /* Then the over-long line is rejected and the NOOP behind it survives:
+     * truncating the segment would have thrown away the '\n' that ends the
+     * bad line, swallowing the next command with it. */
+    REQUIRE(out == "500 Command line too long.\r\n200 NOOP ok.\r\n");
+
+    /* And the buffer is back in sync for whatever arrives next. */
+    REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
+}
+
+TEST_CASE("accept callbacks release the listener's backlog slot", "[lwip]")
+{
+    /* lwIP's raw API requires tcp_accepted() on the *listening* PCB from
+     * every accept callback; without it a build with TCP_LISTEN_BACKLOG
+     * enabled stops accepting once the backlog fills. */
+    init_server();
+
+    Client c = connect_client();
+    REQUIRE(mock_tcp_accepted_calls[kListenIdx] == 1);
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int pasv_idx = mock_tcp_pcb_index(data_pcb) - 1;
+    REQUIRE(mock_tcp_accepted_calls[pasv_idx] == 1);
+
+    /* A second control connection releases its slot too. */
+    (void)connect_client();
+    REQUIRE(mock_tcp_accepted_calls[kListenIdx] == 2);
+}
+
+TEST_CASE("a listener that fails to close is not aborted", "[lwip]")
+{
+    /* tcp_abort() asserts "don't call tcp_abort for listen-pcbs" in lwIP, so
+     * the close-degrades-to-abort fallback must skip listening PCBs. */
+    init_server();
+    Client c = connect_client();
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+
+    static int s_aborts;
+    s_aborts = 0;
+    mock_tcp_close_fn = [](struct tcp_pcb *) -> err_t { return ERR_MEM; };
+    mock_tcp_abort_fn = [](struct tcp_pcb *) { s_aborts++; };
+
+    /* ABOR closes the data channel, listener included. */
+    (void)send_cmd(c, "ABOR\r\n");
+
+    mock_tcp_close_fn = nullptr;
+    mock_tcp_abort_fn = nullptr;
+
+    /* Only the connected data PCB may be aborted — never the listener. */
+    REQUIRE(s_aborts == 0);
 }

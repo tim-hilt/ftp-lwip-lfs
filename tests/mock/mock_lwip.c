@@ -70,6 +70,7 @@ tcp_recv_fn    mock_tcp_cb_recv[MOCK_TCP_MAX_PCBS];
 tcp_sent_fn    mock_tcp_cb_sent[MOCK_TCP_MAX_PCBS];
 tcp_err_fn     mock_tcp_cb_err[MOCK_TCP_MAX_PCBS];
 tcp_poll_fn    mock_tcp_cb_poll[MOCK_TCP_MAX_PCBS];
+u16_t          mock_tcp_accepted_calls[MOCK_TCP_MAX_PCBS];
 
 /* ------------------------------------------------------------------ */
 /*  Helper                                                            */
@@ -130,6 +131,7 @@ void mock_lwip_reset(void)
     memset(mock_tcp_cb_sent,   0, sizeof(mock_tcp_cb_sent));
     memset(mock_tcp_cb_err,    0, sizeof(mock_tcp_cb_err));
     memset(mock_tcp_cb_poll,   0, sizeof(mock_tcp_cb_poll));
+    memset(mock_tcp_accepted_calls, 0, sizeof(mock_tcp_accepted_calls));
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,6 +210,12 @@ struct tcp_pcb *tcp_listen_with_backlog(struct tcp_pcb *pcb, u8_t backlog)
         return mock_tcp_listen_with_backlog_fn(pcb, backlog);
     (void)backlog;
     return pcb; /* return same PCB — good enough for the mock */
+}
+
+void tcp_accepted(struct tcp_pcb *lpcb)
+{
+    int i = mock_tcp_pcb_index(lpcb);
+    if (i >= 0) mock_tcp_accepted_calls[i]++;
 }
 
 err_t tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr,
