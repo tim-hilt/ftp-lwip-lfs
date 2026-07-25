@@ -20,6 +20,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <ctype.h>
 
 /* ------------------------------------------------------------------ */
@@ -45,66 +46,70 @@ typedef enum {
 
 /** Per-client session. */
 typedef struct ftp_session {
-    uint8_t              in_use;
-
     /* Control connection */
     struct tcp_pcb      *ctrl_pcb;
-    char                 cmd_buf[FTP_SERVER_CMD_BUF_SIZE];
-    uint16_t             cmd_len;
-
-    /* Authentication */
-    ftp_auth_state_t     auth;
-
-    /* Working directory (always starts and ends with '/') */
-    char                 cwd[FTP_SERVER_PATH_MAX];
-
-    /* Transfer type: 'A' (ASCII) or 'I' (binary) */
-    char                 type;
-
-    /* Pending RNFR path (set by RNFR, consumed by RNTO) */
-    char                 rnfr[FTP_SERVER_PATH_MAX];
-
-    /* Data connection ------------------------------------------------ */
-    ftp_data_mode_t      data_mode;
 
     /* Passive mode listener */
     struct tcp_pcb      *pasv_listen_pcb;
 
-    /* Active mode target */
-    ip_addr_t            port_addr;
-    uint16_t             port_port;
-    uint8_t              port_active; /**< 1 = use active mode */
-
     /* Connected data socket (accepted from PASV or connected via PORT) */
     struct tcp_pcb      *data_pcb;
 
-    /* File / directory being transferred */
-    lfs_file_t           file;
-    lfs_dir_t            dir;
-    uint8_t              file_open;
-    uint8_t              dir_open;
-
-    /* Transfer buffer */
-    uint8_t              data_buf[FTP_SERVER_DATA_BUF_SIZE];
-
-    /* Remaining bytes to flush for current chunk (RETR/LIST) */
-    uint16_t             data_pending;
-    uint16_t             data_offset;
-
-    /* STOR: flag that we are receiving data */
-    uint8_t              stor_active;
-
-    /* RETR: name and size reported in the "150" reply */
-    char                 retr_name[FTP_SERVER_PATH_MAX];
-    lfs_soff_t           retr_size;
-
     /* File cache for lfs_file_opencfg (avoids heap allocation) */
-    uint8_t              file_cache[FTP_SERVER_FILE_CACHE_SIZE];
     struct lfs_file_config file_cfg;
 
-    /* Idle timeout poll counter */
-    uint16_t             idle_polls;
+    /* File / directory being transferred */
+    lfs_dir_t             dir;
+    lfs_file_t            file;
 
+    /* Authentication */
+    ftp_auth_state_t      auth;
+
+    /* Data connection ------------------------------------------------ */
+    ftp_data_mode_t       data_mode;
+
+    /* Active mode target */
+    ip_addr_t             port_addr;
+
+    /* RETR: name and size reported in the "150" reply */
+    lfs_soff_t            retr_size;
+
+    uint16_t              cmd_len;
+    uint16_t              port_port;
+
+    /* Remaining bytes to flush for current chunk (RETR/LIST) */
+    uint16_t              data_pending;
+    uint16_t              data_offset;
+
+    /* Idle timeout poll counter */
+    uint16_t              idle_polls;
+
+    uint8_t               in_use;
+
+    /* Transfer type: 'A' (ASCII) or 'I' (binary) */
+    char                  type;
+
+    uint8_t               port_active; /**< 1 = use active mode */
+    uint8_t               file_open;
+    uint8_t               dir_open;
+
+    /* STOR: flag that we are receiving data */
+    uint8_t               stor_active;
+
+    char                  cmd_buf[FTP_SERVER_CMD_BUF_SIZE];
+
+    /* Working directory (always starts and ends with '/') */
+    char                  cwd[FTP_SERVER_PATH_MAX];
+
+    /* Pending RNFR path (set by RNFR, consumed by RNTO) */
+    char                  rnfr[FTP_SERVER_PATH_MAX];
+
+    char                  retr_name[FTP_SERVER_PATH_MAX];
+
+    uint8_t               file_cache[FTP_SERVER_FILE_CACHE_SIZE];
+
+    /* Transfer buffer */
+    uint8_t               data_buf[FTP_SERVER_DATA_BUF_SIZE];
 } ftp_session_t;
 
 /* ------------------------------------------------------------------ */
@@ -327,6 +332,76 @@ static void ftp_close_session(ftp_session_t *s)
 /* ------------------------------------------------------------------ */
 
 /**
+ * Attempt to flush all pending bytes in data_buf[data_offset..) to the
+ * data PCB. Returns 1 if fully flushed (data_pending == 0), or 0 if
+ * blocked on send buffer space / a tcp_write error — the caller must
+ * return and wait for the next tcp_sent or poll callback.
+ */
+static int ftp_send_pending(ftp_session_t *s)
+{
+    while (s->data_pending > 0) {
+        uint16_t space = tcp_sndbuf(s->data_pcb);
+        if (space == 0) return 0; /* wait for sent callback */
+        uint16_t to_send = (s->data_pending < space) ? s->data_pending : space;
+        err_t err = tcp_write(s->data_pcb, s->data_buf + s->data_offset,
+                              to_send, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK) return 0; /* back-pressure */
+        tcp_output(s->data_pcb);
+        s->data_offset  += to_send;
+        s->data_pending -= to_send;
+    }
+    return 1;
+}
+
+/**
+ * Fill data_buf with the next chunk for the session's current transfer
+ * mode (RETR file data, or LIST/NLST directory entries — "." and ".."
+ * are skipped). Returns the number of bytes filled, or -1 when there is
+ * no more data (EOF, end of directory, or a formatting error).
+ */
+static int ftp_fill_next_chunk(ftp_session_t *s)
+{
+    if (s->data_mode == FTP_DATA_RETR) {
+        lfs_ssize_t r = lfs_file_read(s_lfs, &s->file,
+                                       s->data_buf, FTP_SERVER_DATA_BUF_SIZE);
+        return (r <= 0) ? -1 : (int)r;
+    }
+
+    if (s->data_mode != FTP_DATA_LIST && s->data_mode != FTP_DATA_NLST) {
+        return -1;
+    }
+
+    for (;;) {
+        struct lfs_info info;
+        int r = lfs_dir_read(s_lfs, &s->dir, &info);
+        if (r <= 0) return -1; /* end of directory or error */
+
+        /* Skip . and .. */
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+
+        int n;
+        if (s->data_mode == FTP_DATA_NLST) {
+            n = snprintf((char *)s->data_buf, FTP_SERVER_DATA_BUF_SIZE,
+                         "%s\r\n", info.name);
+        } else {
+            /* LIST: emit a Unix-style listing */
+            const char *type_str = (info.type == LFS_TYPE_DIR)
+                ? "drwxr-xr-x" : "-rw-r--r--";
+            n = snprintf((char *)s->data_buf, FTP_SERVER_DATA_BUF_SIZE,
+                         "%s 1 ftp ftp %10lu Jan 01  2000 %s\r\n",
+                         type_str,
+                         (unsigned long)info.size,
+                         info.name);
+        }
+        if (n < 0) return -1;
+        if (n > (int)FTP_SERVER_DATA_BUF_SIZE) n = (int)FTP_SERVER_DATA_BUF_SIZE;
+        return n;
+    }
+}
+
+/**
  * Fill data_buf with the next chunk and write it to the data PCB.
  * Called after the data connection is established and after each
  * tcp_sent callback confirms the previous chunk was ACK'd.
@@ -336,73 +411,16 @@ static void ftp_send_next_data(ftp_session_t *s)
     if (!s->data_pcb) return;
 
     /* If we have pending bytes from a previous fill, try to send them first. */
-    while (s->data_pending > 0) {
-        uint16_t space = tcp_sndbuf(s->data_pcb);
-        if (space == 0) return; /* wait for sent callback */
-        uint16_t to_send = (s->data_pending < space) ? s->data_pending : space;
-        err_t err = tcp_write(s->data_pcb, s->data_buf + s->data_offset,
-                              to_send, TCP_WRITE_FLAG_COPY);
-        if (err != ERR_OK) return; /* back-pressure */
-        tcp_output(s->data_pcb);
-        s->data_offset  += to_send;
-        s->data_pending -= to_send;
-    }
+    if (!ftp_send_pending(s)) return;
 
-    /* Fill the next chunk. */
+    /* Fill and send subsequent chunks until the transfer is exhausted. */
     for (;;) {
-        int n = 0;
+        int n = ftp_fill_next_chunk(s);
+        if (n < 0) break;
 
-        if (s->data_mode == FTP_DATA_RETR) {
-            lfs_ssize_t r = lfs_file_read(s_lfs, &s->file,
-                                           s->data_buf, FTP_SERVER_DATA_BUF_SIZE);
-            if (r <= 0) break; /* EOF or error */
-            n = (int)r;
-        } else if (s->data_mode == FTP_DATA_LIST ||
-                   s->data_mode == FTP_DATA_NLST) {
-            struct lfs_info info;
-            int r = lfs_dir_read(s_lfs, &s->dir, &info);
-            if (r <= 0) break; /* end of directory or error */
-
-            /* Skip . and .. */
-            if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
-                continue;
-            }
-
-            if (s->data_mode == FTP_DATA_NLST) {
-                n = snprintf((char *)s->data_buf, FTP_SERVER_DATA_BUF_SIZE,
-                             "%s\r\n", info.name);
-            } else {
-                /* LIST: emit a Unix-style listing */
-                const char *type_str = (info.type == LFS_TYPE_DIR)
-                    ? "drwxr-xr-x" : "-rw-r--r--";
-                n = snprintf((char *)s->data_buf, FTP_SERVER_DATA_BUF_SIZE,
-                             "%s 1 ftp ftp %10lu Jan 01  2000 %s\r\n",
-                             type_str,
-                             (unsigned long)info.size,
-                             info.name);
-            }
-            if (n < 0) break;
-            if (n > (int)FTP_SERVER_DATA_BUF_SIZE)
-                n = (int)FTP_SERVER_DATA_BUF_SIZE;
-        } else {
-            break;
-        }
-
-        /* Try to write this chunk. */
         s->data_offset  = 0;
         s->data_pending = (uint16_t)n;
-
-        while (s->data_pending > 0) {
-            uint16_t space = tcp_sndbuf(s->data_pcb);
-            if (space == 0) return; /* wait for sent callback */
-            uint16_t to_send = (s->data_pending < space) ? s->data_pending : space;
-            err_t err = tcp_write(s->data_pcb, s->data_buf + s->data_offset,
-                                  to_send, TCP_WRITE_FLAG_COPY);
-            if (err != ERR_OK) return;
-            tcp_output(s->data_pcb);
-            s->data_offset  += to_send;
-            s->data_pending -= to_send;
-        }
+        if (!ftp_send_pending(s)) return;
     }
 
     /* Transfer complete — close data connection and inform client. */
@@ -771,11 +789,25 @@ static void cmd_port(ftp_session_t *s, const char *arg)
     }
     ftp_close_data(s);
 
-    unsigned int h1, h2, h3, h4, p1, p2;
-    if (sscanf(arg, "%u,%u,%u,%u,%u,%u", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
-        ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
-        return;
+    unsigned long fields[6];
+    const char *p = arg;
+    for (int i = 0; i < 6; i++) {
+        char *end = NULL;
+        fields[i] = strtoul(p, &end, 10);
+        if (end == p || fields[i] > 255) {
+            ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
+            return;
+        }
+        char expect = (i < 5) ? ',' : '\0';
+        if (*end != expect) {
+            ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
+            return;
+        }
+        p = end + 1;
     }
+    unsigned int h1 = (unsigned int)fields[0], h2 = (unsigned int)fields[1];
+    unsigned int h3 = (unsigned int)fields[2], h4 = (unsigned int)fields[3];
+    unsigned int p1 = (unsigned int)fields[4], p2 = (unsigned int)fields[5];
 
     IP_ADDR4(&s->port_addr, h1, h2, h3, h4);
     s->port_port   = (uint16_t)((p1 << 8) | p2);
@@ -1276,6 +1308,8 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     }
 
     s->ctrl_pcb = pcb;
+    /* FTP_SERVER_USER defaults to NULL but is project-configurable (ftp_server.h). */
+    // NOLINTNEXTLINE(misc-redundant-expression)
     s->auth     = (FTP_SERVER_USER == NULL)
                       ? FTP_STATE_LOGGED_IN
                       : FTP_STATE_WAIT_USER;

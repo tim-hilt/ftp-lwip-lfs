@@ -1,0 +1,63 @@
+---
+# Scope: ftp_server.c / ftp_server.h only. lwip/ and littlefs/ are vendored
+# submodules with their own upstream style and are excluded via
+# HeaderFilterRegex plus CI path filtering (see .github/workflows/clang-tidy.yml).
+#
+# Ruleset rationale (see AGENTS.md):
+#   - "minimal binary size required"   -> performance-*, readability-*,
+#     misc-* catch dead code, redundant copies and bloat-prone patterns.
+#   - "no heap allocations"            -> cppcoreguidelines-no-malloc and
+#     hicpp-no-malloc turn any malloc/calloc/realloc/free/new use into an
+#     error; the project's static session table must stay static.
+#   - Plain C99, no C++                -> modernize-*, cppcoreguidelines-*
+#     (besides no-malloc) and hicpp-* (besides no-malloc) are disabled since
+#     they either don't apply to C or assume C++ idioms.
+
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  clang-diagnostic-*,
+  cppcoreguidelines-no-malloc,
+  hicpp-no-malloc,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner,
+  -readability-braces-around-statements,
+  -readability-identifier-length,
+  -readability-isolate-declaration,
+  -readability-magic-numbers,
+  -readability-uppercase-literal-suffix
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^(?!.*/(lwip|littlefs)/).*ftp_server\.h$'
+FormatStyle: none
+
+CheckOptions:
+  # Dispatch/state-machine functions (command table, poll/recv callbacks)
+  # are inherently long in a single-TU embedded server; raise the bar
+  # instead of silencing the check.
+  - key: readability-function-cognitive-complexity.Threshold
+    value: '50'
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.StaticVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.TypedefCase
+    value: lower_case
+  - key: readability-identifier-naming.EnumCase
+    value: lower_case
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+  - key: cert-dcl37-c.AggressiveDependentMemberLookup
+    value: 'false'

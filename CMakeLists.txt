@@ -3,6 +3,15 @@ project(ftp_lwip_lfs C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Opt-in clang-tidy pass over ftp_server.c/.h only (see .clang-tidy).
+# Off by default so a missing clang-tidy binary never breaks a plain build.
+option(FTP_SERVER_ENABLE_CLANG_TIDY "Run clang-tidy on ftp_server sources" OFF)
+if(FTP_SERVER_ENABLE_CLANG_TIDY)
+    find_program(FTP_SERVER_CLANG_TIDY_EXE NAMES clang-tidy REQUIRED)
+    set(FTP_SERVER_CLANG_TIDY_COMMAND "${FTP_SERVER_CLANG_TIDY_EXE}")
+endif()
 
 # lwIP (raw TCP API + IPv4 only — matches ftp_server.c's usage)
 set(LWIP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lwip)
@@ -74,3 +83,6 @@ target_compile_options(ftp_server PRIVATE
     -Wunused-macros
     -Wunused-const-variable
 )
+if(FTP_SERVER_ENABLE_CLANG_TIDY)
+    set_target_properties(ftp_server PROPERTIES C_CLANG_TIDY "${FTP_SERVER_CLANG_TIDY_COMMAND}")
+endif()

@@ -105,3 +105,22 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 - Only one data connection is active per session at a time.
 - Each session's LFS file cache buffer (`FTP_SERVER_FILE_CACHE_SIZE`) must be >= `lfs_config.cache_size`; `ftp_server_init()` returns `ERR_ARG` otherwise.
 - Designed for constrained targets: no dynamic allocation beyond the static `s_sessions[FTP_SERVER_MAX_CLIENTS]` table.
+
+## Static Analysis
+
+`ftp_server.c`/`.h` are linted with [clang-tidy](https://clang.llvm.org/extra/clang-tidy/) (config: `.clang-tidy`); `lwip/` and `littlefs/` are vendored submodules and are excluded. Ruleset covers `bugprone-*`, `cert-*`, `clang-analyzer-*`, `misc-*`, `performance-*`, `portability-*`, `readability-*`, plus `cppcoreguidelines-no-malloc`/`hicpp-no-malloc` to enforce the no-heap-allocation guideline.
+
+Run it locally:
+
+```sh
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+clang-tidy -p build ftp_server.c
+```
+
+On macOS with Homebrew LLVM, pass the SDK sysroot explicitly (Apple Clang's driver does this automatically, but `clang-tidy` does not):
+
+```sh
+clang-tidy -p build --extra-arg=-isysroot --extra-arg=$(xcrun --show-sdk-path) ftp_server.c
+```
+
+Alternatively, build with `-DFTP_SERVER_ENABLE_CLANG_TIDY=ON` to run clang-tidy as part of `ftp_server`'s build step. CI runs it on every push/PR via `.github/workflows/clang-tidy.yml`.
