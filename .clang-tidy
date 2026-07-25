@@ -1,7 +1,7 @@
 ---
 # Scope: ftp_server.c / ftp_server.h only. lwip/ and littlefs/ are vendored
 # submodules with their own upstream style and are excluded via
-# HeaderFilterRegex plus CI path filtering (see .github/workflows/clang-tidy.yml).
+# HeaderFilterRegex plus CI path filtering (see .github/workflows/ci.yml).
 #
 # Ruleset rationale (see AGENTS.md):
 #   - "minimal binary size required"   -> performance-*, readability-*,

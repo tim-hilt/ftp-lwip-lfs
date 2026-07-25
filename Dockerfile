@@ -1,4 +1,4 @@
-# Reproduces the `clang-tidy` GitHub Actions job (.github/workflows/clang-tidy.yml)
+# Reproduces the `clang-tidy` GitHub Actions job (.github/workflows/ci.yml)
 # exactly, so the same errors surface locally as in CI.
 #
 # Usage:
