@@ -1240,14 +1240,24 @@ static err_t ftp_ctrl_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         uint16_t line_len = (uint16_t)(nl - s->cmd_buf + 1);
 
         /* Save total buffered length, then tell process_command the line
-         * length so it can NUL-terminate correctly. */
+         * length so it can NUL-terminate correctly. ftp_process_command()
+         * writes a NUL at cmd_buf[line_len]; when more data follows in
+         * the buffer (pipelined commands in one TCP segment) that byte
+         * belongs to the next queued line, so it must be preserved and
+         * restored afterwards instead of being permanently clobbered. */
         uint16_t saved_total = s->cmd_len;
+        uint8_t  have_saved_byte = (line_len < saved_total);
+        char     saved_byte = have_saved_byte ? s->cmd_buf[line_len] : '\0';
         s->cmd_len = line_len;
 
         ftp_process_command(s);
 
         /* Session may have been freed by QUIT. */
         if (!s->in_use) return ERR_OK;
+
+        if (have_saved_byte) {
+            s->cmd_buf[line_len] = saved_byte;
+        }
 
         /* Shift remaining bytes to the front of the buffer. */
         uint16_t remaining = saved_total - line_len;
