@@ -1,5 +1,8 @@
 # ftp-lwip-lfs
 
+[![Build](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml?query=branch%3Amain)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tim-hilt/ftp-lwip-lfs/main/.github/badges/coverage.json)](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml?query=branch%3Amain)
+
 A minimal FTP server for embedded systems, built on the [lwIP](https://savannah.nongnu.org/projects/lwip/) raw TCP API and backed by a [LittleFS](https://github.com/littlefs-project/littlefs) filesystem. It exposes a small C API (`ftp_server.h`) intended to be dropped into a microcontroller firmware project.
 
 ## Features
@@ -108,13 +111,16 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 
 ## Continuous Integration
 
-`.github/workflows/ci.yml` runs on every push/PR to `main` with three independent jobs, all required to pass:
+`.github/workflows/ci.yml` (workflow name `Build`) runs on every push/PR to `main` with four jobs; `build`, `unit-tests`, and `clang-tidy` are required to pass:
 
 | Job           | What it checks                                                          |
 |---------------|--------------------------------------------------------------------------|
 | `build`       | `ftp_server.c`/`.h` compile cleanly (`-Werror` + unused-code warnings). |
 | `unit-tests`  | The Catch2 suite (`tests/test_main.cpp`) builds and all tests pass.     |
 | `clang-tidy`  | Static analysis is clean (see below).                                  |
+| `coverage`    | Computes line coverage of `ftp_server.c` (via `gcovr`) after `build`/`unit-tests` pass; on `main` pushes it commits the badge data to `.github/badges/coverage.json`. |
+
+The two badges above the project title read this directly: **Build** is GitHub's native workflow badge for the `Build` workflow on `main`; **Coverage** is a [shields.io endpoint badge](https://shields.io/badges/endpoint-badge) pointing at the raw `.github/badges/coverage.json` on `main`, which the `coverage` job keeps up to date.
 
 ## Testing
 

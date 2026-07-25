@@ -13,6 +13,11 @@ if(FTP_SERVER_ENABLE_CLANG_TIDY)
     set(FTP_SERVER_CLANG_TIDY_COMMAND "${FTP_SERVER_CLANG_TIDY_EXE}")
 endif()
 
+# Opt-in coverage instrumentation for ftp_server.c, consumed by the CI
+# `coverage` job to compute the README coverage badge. Off by default —
+# instrumented builds are slower and irrelevant to normal development.
+option(FTP_SERVER_ENABLE_COVERAGE "Build ftp_server with --coverage instrumentation" OFF)
+
 # --------------------------------------------------------------------
 # Mock library — stub lwIP + LFS implementations.
 #
@@ -45,6 +50,10 @@ target_compile_options(ftp_server PRIVATE
 )
 if(FTP_SERVER_ENABLE_CLANG_TIDY)
     set_target_properties(ftp_server PROPERTIES C_CLANG_TIDY "${FTP_SERVER_CLANG_TIDY_COMMAND}")
+endif()
+if(FTP_SERVER_ENABLE_COVERAGE)
+    target_compile_options(ftp_server PRIVATE --coverage -O0 -g)
+    target_link_options(ftp_server PUBLIC --coverage)
 endif()
 
 # --------------------------------------------------------------------

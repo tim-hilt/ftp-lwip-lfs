@@ -1,4 +1,4 @@
-name: ci
+name: Build
 
 on:
   push:
@@ -46,3 +46,60 @@ jobs:
 
       - name: Run clang-tidy (ftp_server.c/.h only)
         run: docker run --rm -v "${{ github.workspace }}":/repo ftp-lwip-lfs-clang-tidy
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    needs: [build, unit-tests]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcovr
+        run: sudo apt-get update && sudo apt-get install -y gcovr
+
+      - name: Configure (coverage instrumentation)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFTP_SERVER_BUILD_TESTS=ON -DFTP_SERVER_ENABLE_COVERAGE=ON
+
+      - name: Build tests
+        run: cmake --build build --target ftp_tests -j
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Compute coverage percentage
+        id: cov
+        run: |
+          gcovr --root . --filter '.*ftp_server\.c$' --json-summary-pretty --json-summary coverage-summary.json build/
+          pct=$(python3 -c "import json; print(round(json.load(open('coverage-summary.json'))['line_percent'], 1))")
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+
+      - name: Generate coverage badge
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          pct="${{ steps.cov.outputs.pct }}"
+          color=red
+          awk "BEGIN { exit !($pct >= 80) }" && color=brightgreen
+          awk "BEGIN { exit !($pct >= 50 && $pct < 80) }" && color=yellow
+          mkdir -p .github/badges
+          cat > .github/badges/coverage.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "coverage",
+            "message": "${pct}%",
+            "color": "${color}"
+          }
+          EOF
+
+      - name: Commit coverage badge
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/coverage.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update coverage badge [skip ci]"
+            git push
+          fi
