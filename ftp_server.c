@@ -536,6 +536,7 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
 
 static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
+    (void)err;
     ftp_session_t *s = (ftp_session_t *)arg;
     if (!s) {
         if (p) pbuf_free(p);
@@ -1295,6 +1296,7 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
 err_t ftp_server_init(lfs_t *lfs)
 {
     if (!lfs) return ERR_ARG;
+    if (lfs->cfg->cache_size > FTP_SERVER_FILE_CACHE_SIZE) return ERR_ARG;
     s_lfs = lfs;
 
     memset(s_sessions, 0, sizeof(s_sessions));

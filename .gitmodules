@@ -1,0 +1,6 @@
+[submodule "littlefs"]
+	path = littlefs
+	url = git@github.com:littlefs-project/littlefs.git
+[submodule "lwip"]
+	path = lwip
+	url = git@github.com:lwip-tcpip/lwip.git

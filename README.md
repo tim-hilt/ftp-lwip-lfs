@@ -58,7 +58,7 @@ Override any of these macros before including `ftp_server.h` (e.g. via a `-D` co
 | `FTP_SERVER_DATA_BUF_SIZE`        | `512`   | Per-session transfer buffer size (bytes).         |
 | `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes).     |
 | `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length.                     |
-| `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must match `lfs_config.cache_size`. |
+| `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must be >= `lfs_config.cache_size` (checked at `ftp_server_init()`). |
 | `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected. |
 
 ## Usage
@@ -103,5 +103,5 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 ## Notes
 
 - Only one data connection is active per session at a time.
-- Each session's LFS file cache buffer size must match `lfs_config.cache_size` (`FTP_SERVER_FILE_CACHE_SIZE`).
+- Each session's LFS file cache buffer (`FTP_SERVER_FILE_CACHE_SIZE`) must be >= `lfs_config.cache_size`; `ftp_server_init()` returns `ERR_ARG` otherwise.
 - Designed for constrained targets: no dynamic allocation beyond the static `s_sessions[FTP_SERVER_MAX_CLIENTS]` table.

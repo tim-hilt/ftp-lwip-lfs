@@ -18,7 +18,7 @@
  *   FTP_SERVER_CMD_BUF_SIZE   - Per-session command line buffer (default 256)
  *   FTP_SERVER_PATH_MAX       - Maximum path length (default 256)
  *   FTP_SERVER_FILE_CACHE_SIZE - LFS file cache per session (default 256,
- *                                must match lfs_config.cache_size)
+ *                                must be >= lfs_config.cache_size)
  *   FTP_SERVER_IDLE_TIMEOUT_POLLS - Idle polls before disconnect (default 60)
  */
 
@@ -74,7 +74,8 @@ extern "C" {
 #endif
 
 #ifndef FTP_SERVER_FILE_CACHE_SIZE
-/** Must match the cache_size used in your lfs_config. */
+/** Must be >= the cache_size used in your lfs_config; ftp_server_init()
+ *  rejects a mismatch that would overflow this buffer. */
 #define FTP_SERVER_FILE_CACHE_SIZE 256
 #endif
 
