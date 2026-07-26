@@ -108,8 +108,9 @@ TEST_CASE("accepting a control connection sends the greeting", "[connect]")
     (void)c;
 }
 
-TEST_CASE("beyond FTP_SERVER_MAX_CLIENTS the connection is aborted", "[connect]")
+TEST_CASE("beyond FTP_SERVER_MAX_CLIENTS the client is told why", "[connect]")
 {
+    /* GIVEN every session slot is taken */
     init_server();
 
     for (int i = 0; i < FTP_SERVER_MAX_CLIENTS; i++) {
@@ -118,18 +119,51 @@ TEST_CASE("beyond FTP_SERVER_MAX_CLIENTS the connection is aborted", "[connect]"
     }
 
     static struct tcp_pcb *s_aborted_pcb;
+    static struct tcp_pcb *s_closed_pcb;
     s_aborted_pcb = nullptr;
-    struct Hook {
-        static void fn(struct tcp_pcb *pcb) { s_aborted_pcb = pcb; }
+    s_closed_pcb  = nullptr;
+    mock_tcp_abort_fn = [](struct tcp_pcb *pcb) { s_aborted_pcb = pcb; };
+    mock_tcp_close_fn = [](struct tcp_pcb *pcb) -> err_t {
+        s_closed_pcb = pcb;
+        return ERR_OK;
     };
-    mock_tcp_abort_fn = Hook::fn;
+
+    /* WHEN one more control connection arrives */
+    u16_t before = mock_tcp_write_len;
+    struct tcp_pcb *pcb = tcp_new();
+    err_t err = mock_tcp_cb_accept[kListenIdx](mock_tcp_cb_arg[kListenIdx], pcb, ERR_OK);
+    mock_tcp_abort_fn = nullptr;
+    mock_tcp_close_fn = nullptr;
+
+    /* THEN it is refused with a 421 and hung up gracefully, so the reply is
+     * actually delivered — tcp_abort() would discard it. */
+    REQUIRE(written_since(before) == "421 Too many users, try again later.\r\n");
+    REQUIRE(s_closed_pcb == pcb);
+    REQUIRE(s_aborted_pcb == nullptr);
+    REQUIRE(err == ERR_OK);
+}
+
+TEST_CASE("a refused control connection still aborts if the close fails",
+          "[connect][lwip]")
+{
+    init_server();
+    for (int i = 0; i < FTP_SERVER_MAX_CLIENTS; i++) {
+        Client c = connect_client();
+        (void)c;
+    }
+
+    static struct tcp_pcb *s_aborted_pcb;
+    s_aborted_pcb = nullptr;
+    mock_tcp_abort_fn = [](struct tcp_pcb *pcb) { s_aborted_pcb = pcb; };
+    mock_tcp_close_fn = [](struct tcp_pcb *) -> err_t { return ERR_MEM; };
 
     struct tcp_pcb *pcb = tcp_new();
     err_t err = mock_tcp_cb_accept[kListenIdx](mock_tcp_cb_arg[kListenIdx], pcb, ERR_OK);
     mock_tcp_abort_fn = nullptr;
+    mock_tcp_close_fn = nullptr;
 
-    REQUIRE(err == ERR_ABRT);
     REQUIRE(s_aborted_pcb == pcb);
+    REQUIRE(err == ERR_ABRT);
 }
 
 TEST_CASE("the accept callback rejects a failed connection", "[connect]")
@@ -329,13 +363,31 @@ TEST_CASE("TYPE command", "[commands]")
     SECTION("accepts binary mode") {
         REQUIRE(send_cmd(c, "TYPE I\r\n") == "200 Switching to Binary mode.\r\n");
     }
-    SECTION("rejects ASCII mode") {
+    SECTION("accepts ASCII mode") {
+        /* RFC 959 section 3.1.1.1: ASCII is the default type and must be
+         * accepted by every implementation. Transfers stay byte-transparent,
+         * which the reply text is honest about. */
         REQUIRE(send_cmd(c, "TYPE A\r\n") ==
-                "504 ASCII transfer mode not supported, use binary.\r\n");
+                "200 Type set to A (no conversion performed).\r\n");
+    }
+    SECTION("accepts the default Non-print format parameter") {
+        REQUIRE(send_cmd(c, "TYPE A N\r\n") ==
+                "200 Type set to A (no conversion performed).\r\n");
+        REQUIRE(send_cmd(c, "TYPE I N\r\n") == "200 Switching to Binary mode.\r\n");
+    }
+    SECTION("rejects a non-default format parameter") {
+        REQUIRE(send_cmd(c, "TYPE A T\r\n") ==
+                "504 Only types A and I are supported.\r\n");
+    }
+    SECTION("rejects EBCDIC and local byte") {
+        REQUIRE(send_cmd(c, "TYPE E\r\n") ==
+                "504 Only types A and I are supported.\r\n");
+        REQUIRE(send_cmd(c, "TYPE L 8\r\n") ==
+                "504 Only types A and I are supported.\r\n");
     }
     SECTION("rejects missing argument") {
         REQUIRE(send_cmd(c, "TYPE\r\n") ==
-                "504 ASCII transfer mode not supported, use binary.\r\n");
+                "504 Only types A and I are supported.\r\n");
     }
 }
 
@@ -388,6 +440,64 @@ TEST_CASE("multiple commands in one TCP segment are all processed", "[commands]"
     REQUIRE(out == "215 UNIX Type: L8\r\n"
                    "200 NOOP ok.\r\n"
                    "257 \"/\" is the current directory.\r\n");
+}
+
+TEST_CASE("Telnet control sequences are stripped before dispatch", "[commands]")
+{
+    /* RFC 959 section 4.1: a client sending a command during a transfer
+     * precedes it with the Telnet "Interrupt Process" and "Synch" signals.
+     * lwIP does not interpret the urgent pointer, so the IAC bytes arrive
+     * inline and have to be removed here or every ABOR reads as garbage. */
+    init_server();
+    Client c = connect_client();
+
+    const std::string iac_ip = "\xFF\xF4"; /* IAC IP   */
+    const std::string iac_dm = "\xFF\xF2"; /* IAC DM   */
+
+    SECTION("ABOR preceded by IP and Synch is recognised") {
+        REQUIRE(send_cmd(c, iac_ip + iac_dm + "ABOR\r\n") ==
+                "226 ABOR command successful.\r\n");
+    }
+
+    SECTION("a sequence embedded mid-line is removed") {
+        REQUIRE(send_cmd(c, "NO" + iac_ip + "OP\r\n") == "200 NOOP ok.\r\n");
+    }
+
+    SECTION("negotiation verbs consume their option byte") {
+        /* IAC DO BINARY (0xFF 0xFD 0x00) is three bytes, not two — dropping
+         * only two would leave the option byte in front of the command. The
+         * option here is NUL, which also proves the strip is length-based
+         * rather than walking a C string. */
+        REQUIRE(send_cmd(c, std::string("\xFF\xFD\x00", 3) + "SYST\r\n") ==
+                "215 UNIX Type: L8\r\n");
+        REQUIRE(send_cmd(c, std::string("\xFF\xFB\x01", 3) + "NOOP\r\n") ==
+                "200 NOOP ok.\r\n");
+    }
+
+    SECTION("a stray NUL does not truncate the line") {
+        REQUIRE(send_cmd(c, std::string("SY\x00ST\r\n", 7)) ==
+                "215 UNIX Type: L8\r\n");
+    }
+
+    SECTION("a doubled IAC is data, not a command") {
+        /* IAC IAC is the escape for a literal 0xFF, which is not a valid
+         * command character — so the line must survive as garbage, not be
+         * silently turned into a real command. */
+        REQUIRE(send_cmd(c, "\xFF\xFF" "SYST\r\n") ==
+                "502 Command not implemented.\r\n");
+    }
+
+    SECTION("a truncated sequence at end of line is dropped") {
+        REQUIRE(send_cmd(c, "SYST\xFF\r\n") == "215 UNIX Type: L8\r\n");
+        REQUIRE(send_cmd(c, "SYST\xFF\xFB\r\n") == "215 UNIX Type: L8\r\n");
+    }
+
+    SECTION("an argument keeps its bytes") {
+        mock_lfs_stat_fn = stat_is_dir;
+        REQUIRE(send_cmd(c, iac_ip + "CWD /sub\r\n") ==
+                "250 Directory successfully changed.\r\n");
+        REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/sub\" is the current directory.\r\n");
+    }
 }
 
 TEST_CASE("a command split across two TCP segments is reassembled", "[commands]")
@@ -652,6 +762,37 @@ TEST_CASE("MKD creates a directory or reports failure", "[fs]")
     }
 }
 
+TEST_CASE("257 replies double an embedded quote", "[fs]")
+{
+    /* RFC 959 Appendix II: the pathname in a 257 is quoted and every embedded
+     * double quote is doubled, so the client can tell which quote ends it. */
+    init_server();
+    Client c = connect_client();
+
+    SECTION("MKD echoes the created path") {
+        REQUIRE(send_cmd(c, "MKD od\"d\r\n") == "257 \"/od\"\"d\" created.\r\n");
+    }
+
+    SECTION("PWD echoes the current directory") {
+        mock_lfs_stat_fn = stat_is_dir;
+        REQUIRE(send_cmd(c, "CWD /a\"b\r\n") ==
+                "250 Directory successfully changed.\r\n");
+        REQUIRE(send_cmd(c, "PWD\r\n") ==
+                "257 \"/a\"\"b\" is the current directory.\r\n");
+    }
+
+    SECTION("a quoted path too long for the reply buffer is truncated, not overrun") {
+        /* Doubling can grow the name past the shared reply buffer. The reply
+         * must still be a well-formed, terminated 257 line. */
+        std::string name(FTP_SERVER_PATH_MAX - 8, '"');
+        std::string reply = send_cmd(c, "MKD " + name + "\r\n");
+
+        REQUIRE(reply.rfind("257 \"/", 0) == 0);
+        REQUIRE(reply.size() < FTP_SERVER_PATH_MAX + 64);
+        REQUIRE(reply.substr(reply.size() - 12) == "\" created.\r\n");
+    }
+}
+
 TEST_CASE("RMD removes a directory or reports failure", "[fs]")
 {
     init_server();
@@ -773,6 +914,16 @@ TEST_CASE("RNFR / RNTO rename flow", "[fs]")
          * gate, so it counts as "something happened in between". */
         REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
         REQUIRE(send_cmd(c, "FROB\r\n") == "502 Command not implemented.\r\n");
+        REQUIRE(send_cmd(c, "RNTO b.txt\r\n") == "503 RNFR required first.\r\n");
+    }
+
+    SECTION("an intervening command handled before the auth gate cancels it") {
+        /* USER, PASS and QUIT are dispatched without passing through the
+         * login check, so the rename must be cancelled ahead of that branch —
+         * otherwise an RNFR survives a re-login and a later RNTO completes it
+         * under whatever credentials the client has by then. */
+        REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
+        REQUIRE(send_cmd(c, "USER somebody\r\n") == "230 Login successful.\r\n");
         REQUIRE(send_cmd(c, "RNTO b.txt\r\n") == "503 RNFR required first.\r\n");
     }
 
@@ -906,6 +1057,78 @@ TEST_CASE("PORT refuses an address other than the client's", "[port][security]")
 
     /* And no data channel was armed by the rejected command. */
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("PORT is refused when the client's address is unknown", "[port][security]")
+{
+    /* An unverifiable peer must fail closed: accepting the argument would
+     * reinstate the bounce hole the check above exists to close. */
+    init_server();
+    Client c = connect_client();
+
+    mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *, int, ip_addr_t *,
+                                          u16_t *) -> err_t { return ERR_VAL; };
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,1\r\n") ==
+            "501 PORT address must match the control connection.\r\n");
+    mock_tcp_tcp_get_tcp_addrinfo_fn = nullptr;
+
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("PASV refuses a data connection from another host", "[pasv][security]")
+{
+    /* The passive counterpart of the PORT bounce check (RFC 2577). The
+     * listener binds IP_ADDR_ANY, so without this anyone who can reach the
+     * passive port may race the real client onto it and take delivery of a
+     * RETR — or supply the contents of a STOR. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227 ", 0) == 0);
+
+    static struct tcp_pcb *s_ctrl;
+    s_ctrl = c.pcb;
+
+    SECTION("a peer that does not match the control connection") {
+        mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *pcb, int local,
+                                              ip_addr_t *addr, u16_t *port) -> err_t {
+            if (addr) {
+                if (pcb == s_ctrl || local) IP4_ADDR(addr, 192, 168, 1, 1);
+                else                        IP4_ADDR(addr, 10, 0, 0, 7);
+            }
+            if (port) *port = 21;
+            return ERR_OK;
+        };
+    }
+
+    SECTION("a peer that cannot be determined at all") {
+        /* Fail closed rather than admit an unverifiable connection. */
+        mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *, int, ip_addr_t *,
+                                              u16_t *) -> err_t { return ERR_VAL; };
+    }
+
+    static struct tcp_pcb *s_aborted;
+    s_aborted = nullptr;
+    mock_tcp_abort_fn = [](struct tcp_pcb *pcb) { s_aborted = pcb; };
+
+    struct tcp_pcb *intruder = tcp_new();
+    int pasv_idx = mock_tcp_pcb_index(intruder) - 1;
+    u16_t before = mock_tcp_write_len;
+    err_t err = mock_tcp_cb_accept[pasv_idx](mock_tcp_cb_arg[pasv_idx],
+                                             intruder, ERR_OK);
+
+    REQUIRE(err == ERR_ABRT);
+    REQUIRE(s_aborted == intruder);
+    REQUIRE(written_since(before).empty());
+
+    /* The listener stays open, so the genuine client can still connect. */
+    mock_tcp_tcp_get_tcp_addrinfo_fn = nullptr;
+    mock_tcp_abort_fn = nullptr;
+
+    struct tcp_pcb *client_data = tcp_new();
+    client_data->snd_buf = 4096;
+    REQUIRE(mock_tcp_cb_accept[pasv_idx](mock_tcp_cb_arg[pasv_idx],
+                                         client_data, ERR_OK) == ERR_OK);
 }
 
 TEST_CASE("PORT rejects malformed arguments", "[port]")
@@ -1537,10 +1760,16 @@ TEST_CASE("active-mode data connection failures are reported", "[transfer]")
         mock_tcp_abort_fn = nullptr;
     }
 
-    SECTION("the connect completes with an error") {
+    SECTION("a connect that completes for a session that moved on") {
+        /* lwIP invokes the connected callback only on success (tcp_in.c has
+         * the single call site, always with ERR_OK); a failed connect is
+         * reported through tcp_err instead — covered by "an active-mode
+         * connect that fails reports 425, not 426". What can still happen is
+         * the handshake landing after the session gave up on it, and then the
+         * stray PCB must simply be closed. */
         static tcp_connected_fn s_cb;
         static struct tcp_pcb  *s_pcb;
-        s_cb = nullptr;
+        s_cb  = nullptr;
         s_pcb = nullptr;
         mock_tcp_connect_fn = [](struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
                                  tcp_connected_fn connected) -> err_t {
@@ -1552,14 +1781,26 @@ TEST_CASE("active-mode data connection failures are reported", "[transfer]")
         REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty());
         mock_tcp_connect_fn = nullptr;
 
-        int idx = mock_tcp_pcb_index(s_pcb);
-        u16_t before = mock_tcp_write_len;
-        /* lwIP has already freed the PCB by the time it reports the failure. */
-        REQUIRE(s_cb(mock_tcp_cb_arg[idx], nullptr, ERR_ABRT) == ERR_OK);
-        REQUIRE(written_since(before) == "425 Can't open data connection.\r\n");
+        void *arg = mock_tcp_cb_arg[mock_tcp_pcb_index(s_pcb)];
 
-        /* A detached connected callback must be harmless. */
-        REQUIRE(s_cb(nullptr, nullptr, ERR_ABRT) == ERR_OK);
+        /* ABOR cancels the pending transfer while the connect is in flight. */
+        REQUIRE(send_cmd(c, "ABOR\r\n") == "226 ABOR command successful.\r\n");
+
+        static struct tcp_pcb *s_closed;
+        s_closed = nullptr;
+        mock_tcp_close_fn = [](struct tcp_pcb *pcb) -> err_t {
+            s_closed = pcb;
+            return ERR_OK;
+        };
+        u16_t before = mock_tcp_write_len;
+        REQUIRE(s_cb(arg, s_pcb, ERR_OK) == ERR_OK);
+        mock_tcp_close_fn = nullptr;
+
+        REQUIRE(s_closed == s_pcb);            /* the stray PCB is cleaned up */
+        REQUIRE(written_since(before).empty()); /* and nothing is announced */
+
+        /* A detached connected callback must be harmless too. */
+        REQUIRE(s_cb(nullptr, nullptr, ERR_OK) == ERR_OK);
     }
 
     /* Every failure path must leave the session able to transfer again. */
@@ -1627,6 +1868,106 @@ TEST_CASE("STOR writes every pbuf in a chain", "[transfer]")
 
     mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, &p1, ERR_OK);
     REQUIRE(s_written == "first-second");
+}
+
+TEST_CASE("data arriving before STOR is kept, not dropped", "[transfer]")
+{
+    /* A client that connects to the passive port and starts sending without
+     * waiting for the "150" would otherwise lose the head of its upload.
+     * Refusing the pbuf hands it back to lwIP, which parks it in
+     * pcb->refused_data and re-offers it (tcp_fasttmr, every 250 ms) — so no
+     * buffer of our own is needed. */
+    init_server();
+    Client c = connect_client();
+
+    static std::string s_written;
+    s_written.clear();
+    mock_lfs_file_write_fn = [](lfs_t *, lfs_file_t *, const void *buf,
+                                lfs_size_t size) -> lfs_ssize_t {
+        s_written.append(static_cast<const char *>(buf), size);
+        return (lfs_ssize_t)size;
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+
+    /* The data connection opens before the STOR command is issued. */
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    /* Count only what happens to the *data* pbuf/PCB — send_cmd() below runs
+     * a control-connection recv, which frees a pbuf of its own. */
+    static struct pbuf     *s_data_p;
+    static struct tcp_pcb  *s_data_pcb;
+    static int              s_freed;
+    static int              s_recved;
+    s_data_pcb = data_pcb;
+    s_freed    = 0;
+    s_recved   = 0;
+    mock_pbuf_free_fn  = [](struct pbuf *q) -> u8_t {
+        if (q == s_data_p) s_freed++;
+        return 1;
+    };
+    mock_tcp_recved_fn = [](struct tcp_pcb *pcb, u16_t) {
+        if (pcb == s_data_pcb) s_recved++;
+    };
+
+    std::string head = "head-bytes";
+    struct pbuf p = make_pbuf(head);
+    s_data_p = &p;
+    err_t err = mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb,
+                                           &p, ERR_OK);
+
+    /* Refused: the pbuf is still lwIP's, and the window is not reopened. */
+    REQUIRE(err == ERR_MEM);
+    REQUIRE(s_freed == 0);
+    REQUIRE(s_recved == 0);
+    REQUIRE(s_written.empty());
+
+    /* Now the command arrives and lwIP re-offers the same pbuf. */
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n") == "150 Ok to send data.\r\n");
+
+    REQUIRE(mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb,
+                                       &p, ERR_OK) == ERR_OK);
+    REQUIRE(s_freed == 1);
+    REQUIRE(s_recved == 1);
+    REQUIRE(s_written == "head-bytes");
+
+    mock_pbuf_free_fn  = nullptr;
+    mock_tcp_recved_fn = nullptr;
+
+    /* And the upload still completes normally. */
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+}
+
+TEST_CASE("refused data does not keep an idle session alive", "[transfer]")
+{
+    /* lwIP re-offers refused data every 250 ms. Counting that as activity
+     * would let a client that connects, sends junk and never issues a command
+     * hold a session slot open forever. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    std::string junk = "junk";
+    struct pbuf p = make_pbuf(junk);
+
+    for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS; i++) {
+        /* Several re-offers per poll interval, as tcp_fasttmr would do. */
+        for (int r = 0; r < 20; r++) {
+            REQUIRE(mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx],
+                                               data_pcb, &p, ERR_OK) == ERR_MEM);
+        }
+        REQUIRE(mock_tcp_cb_poll[c.idx] != nullptr);
+        mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    }
+
+    /* The session timed out despite the constant re-offers. */
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
 }
 
 TEST_CASE("a detached data recv callback frees the pbuf and stops", "[transfer]")

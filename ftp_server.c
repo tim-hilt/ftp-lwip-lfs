@@ -240,6 +240,21 @@ static int ftp_close_pcb(struct tcp_pcb **ppcb, int listener)
     return 1;
 }
 
+/**
+ * Fetch the remote IPv4 address of @p pcb.
+ *
+ * @return 0 on success, -1 if the peer cannot be determined.
+ */
+static int ftp_peer_ip(struct tcp_pcb *pcb, uint32_t *ip)
+{
+    ip_addr_t addr;
+    u16_t     port;
+    if (!pcb || tcp_tcp_get_tcp_addrinfo(pcb, 0, &addr, &port) != ERR_OK)
+        return -1;
+    *ip = ip_addr_get_ip4_u32(&addr);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Helper: path resolution                                           */
 /* ------------------------------------------------------------------ */
@@ -404,6 +419,34 @@ static void ftp_send_reply(ftp_session_t *s, const char *msg)
     tcp_output(s->ctrl_pcb);
 }
 
+/**
+ * Send a 257 reply naming @p path, followed by @p tail.
+ *
+ * RFC 959 Appendix II: the pathname is quoted and every embedded double quote
+ * is doubled, so the client can tell which quote closes the name. A path whose
+ * quoted form would not fit in s_reply is truncated rather than given a second
+ * FTP_SERVER_PATH_MAX of static RAM — that needs a path near the length limit
+ * made mostly of quote characters.
+ */
+static void ftp_send_257(ftp_session_t *s, const char *path, const char *tail)
+{
+    size_t tail_len = strlen(tail);
+    char       *dst = s_reply;
+    /* Reserve room for the closing quote, the tail and the terminator. */
+    const char *end = s_reply + sizeof(s_reply) - tail_len - 2;
+
+    memcpy(dst, "257 \"", 5);
+    dst += 5;
+    for (; *path && dst < end; path++) {
+        *dst++ = *path;
+        if (*path == '"' && dst < end) *dst++ = '"';
+    }
+    *dst++ = '"';
+    memcpy(dst, tail, tail_len + 1);
+
+    ftp_send_reply(s, s_reply);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Close helpers                                                     */
 /* ------------------------------------------------------------------ */
@@ -490,9 +533,11 @@ static int ftp_transfer_busy(ftp_session_t *s)
  */
 static int ftp_send_pending(ftp_session_t *s)
 {
+    int wrote = 0;
+
     while (s->data_pending > 0) {
         uint16_t space = tcp_sndbuf(s->data_pcb);
-        if (space == 0) return 0; /* wait for sent callback */
+        if (space == 0) break; /* wait for sent callback */
         uint16_t to_send = (s->data_pending < space) ? s->data_pending : space;
         err_t err = tcp_write(s->data_pcb, s->data_buf + s->data_offset,
                               to_send, TCP_WRITE_FLAG_COPY);
@@ -500,13 +545,17 @@ static int ftp_send_pending(ftp_session_t *s)
          * anything else (ERR_CONN, ERR_ARG, ...) never resolves on its own, and
          * treating it as back-pressure would hang the transfer until the idle
          * timer fires. */
-        if (err == ERR_MEM) return 0;
+        if (err == ERR_MEM) break;
         if (err != ERR_OK)  return -1;
-        tcp_output(s->data_pcb);
         s->data_offset  += to_send;
         s->data_pending -= to_send;
+        wrote = 1;
     }
-    return 1;
+
+    /* One flush per call rather than one per tcp_write: the loop only runs
+     * more than once when the send window is smaller than the chunk. */
+    if (wrote) tcp_output(s->data_pcb);
+    return s->data_pending == 0;
 }
 
 /**
@@ -605,33 +654,24 @@ static err_t ftp_data_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 {
     ftp_session_t *s = (ftp_session_t *)arg;
 
+    /* lwIP has exactly one call site for this callback (tcp_in.c, on the ACK
+     * that completes the handshake) and it always passes a live PCB and
+     * ERR_OK; a *failed* connect is reported through tcp_err instead, which
+     * is where ftp_data_err() turns it into a 425. */
+    (void)err;
+
     /* The session may have moved on while the connect was in flight — closed
      * by QUIT, the idle timer or an error, its slot possibly already handed to
      * a different client, or the transfer cancelled by ABOR/PASV. Only a
-     * session still waiting on this connect may be touched; anything else gets
-     * the stray connection closed and nothing else. (lwIP reports a failed
-     * connect with the PCB already freed, so it may pass NULL here — then
-     * data_connecting is all there is to match on.) */
-    int mine = s && s->in_use && s->data_connecting &&
-               (pcb == NULL || s->data_pcb == pcb);
-    if (!mine) {
-        /* lwIP only invokes this callback on a successful connect; a non-OK
-         * err means the PCB has already been freed and must not be touched. */
-        if (err != ERR_OK || !pcb) return ERR_OK;
+     * session still waiting on this very connect may be touched; anything else
+     * gets the stray connection closed and nothing else. */
+    if (!s || !s->in_use || !s->data_connecting || s->data_pcb != pcb) {
         struct tcp_pcb *stale = pcb;
         return ftp_close_pcb(&stale, 0) ? ERR_ABRT : ERR_OK;
     }
 
     s->data_connecting = 0;
-
-    if (err != ERR_OK) {
-        s->data_pcb = NULL; /* already freed by lwIP */
-        ftp_send_reply(s, ftp_reply_no_data);
-        ftp_close_data(s);
-        return ERR_OK;
-    }
-
-    s->data_aborted = 0;
+    s->data_aborted    = 0;
     ftp_start_transfer(s);
     return s->data_aborted ? ERR_ABRT : ERR_OK;
 }
@@ -720,9 +760,26 @@ static void ftp_begin_transfer(ftp_session_t *s)
 
 static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
 {
+    /* lwIP passes a NULL pcb when it could not allocate one for the incoming
+     * connection; there is nothing to abort in that case. */
+    if (!pcb) return ERR_VAL;
+
     ftp_session_t *s = (ftp_session_t *)arg;
     if (err != ERR_OK || !s) {
-        if (!pcb) return ERR_VAL;
+        tcp_abort(pcb);
+        return ERR_ABRT;
+    }
+
+    /* RFC 2577: the data connection must come from the same host as the
+     * control connection — the passive counterpart of the anti-bounce check
+     * in cmd_port(). The listener binds IP_ADDR_ANY, so without this anyone
+     * who can reach the passive port may race the real client onto it and
+     * take delivery of a RETR (or supply the contents of a STOR). Leave the
+     * listener open so the genuine client can still connect. */
+    uint32_t ctrl_ip;
+    uint32_t data_ip;
+    if (ftp_peer_ip(s->ctrl_pcb, &ctrl_ip) < 0 ||
+        ftp_peer_ip(pcb, &data_ip) < 0 || ctrl_ip != data_ip) {
         tcp_abort(pcb);
         return ERR_ABRT;
     }
@@ -756,6 +813,24 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         if (p) pbuf_free(p);
         return ERR_OK;
     }
+
+    /* Data arriving before the command that consumes it has been processed —
+     * a client that connects to the passive port and starts sending without
+     * waiting for the "150". There is nowhere to put it yet, and discarding
+     * it would silently lose the head of the upload.
+     *
+     * Returning a non-OK error *without* consuming the pbuf hands it back to
+     * lwIP, which parks it in pcb->refused_data (tcp_in.c) and re-offers it
+     * from tcp_fasttmr every 250 ms (tcp.c) until it is taken — so the STOR
+     * that follows still receives its first chunk, with no buffer of our own.
+     * A FIN that arrives meanwhile is held back with it, so an upload that
+     * ends here is still reported once the data has actually been written.
+     *
+     * Deliberately not counted as activity below: a client that connects,
+     * sends junk and never issues a command has to hit the idle timeout
+     * rather than keep the session alive by being re-offered forever. */
+    if (p && s->data_mode == FTP_DATA_IDLE) return ERR_MEM;
+
     s->data_aborted = 0;
     /* Data-channel progress keeps the session alive; see ftp_ctrl_poll(). */
     s->idle_polls = 0;
@@ -911,12 +986,29 @@ static int ftp_arg_is_code(const char *arg, char code)
     return arg && toupper((unsigned char)arg[0]) == code && arg[1] == '\0';
 }
 
+/**
+ * RFC 959 section 3.1.1.1 makes ASCII the default representation type and one
+ * that "must be accepted by all FTP implementations"; rejecting it stops the
+ * clients that set TYPE A before a listing. This server is byte-transparent —
+ * it performs no CRLF translation in either direction, which is what a client
+ * moving files onto a flash filesystem wants — so both types behave alike and
+ * the reply says so rather than claiming a conversion that does not happen.
+ */
 static void cmd_type(ftp_session_t *s, const char *arg)
 {
-    if (ftp_arg_is_code(arg, 'I')) {
+    char code = arg ? (char)toupper((unsigned char)arg[0]) : '\0';
+    /* ASCII and EBCDIC take an optional format parameter; only the default,
+     * Non-print, is meaningful here (section 3.1.1.5.1). */
+    int ok = (code == 'A' || code == 'I') &&
+             (arg[1] == '\0' ||
+              (arg[1] == ' ' && ftp_arg_is_code(arg + 2, 'N')));
+
+    if (!ok) {
+        ftp_send_reply(s, "504 Only types A and I are supported.\r\n");
+    } else if (code == 'I') {
         ftp_send_reply(s, "200 Switching to Binary mode.\r\n");
     } else {
-        ftp_send_reply(s, "504 ASCII transfer mode not supported, use binary.\r\n");
+        ftp_send_reply(s, "200 Type set to A (no conversion performed).\r\n");
     }
 }
 
@@ -945,9 +1037,7 @@ static void cmd_stru(ftp_session_t *s, const char *arg)
 static void cmd_pwd(ftp_session_t *s, const char *arg)
 {
     (void)arg;
-    (void)snprintf(s_reply, sizeof(s_reply),
-             "257 \"%s\" is the current directory.\r\n", s->cwd);
-    ftp_send_reply(s, s_reply);
+    ftp_send_257(s, s->cwd, " is the current directory.\r\n");
 }
 
 /** Adopt @p path as the session CWD and confirm it. */
@@ -1071,10 +1161,9 @@ static void cmd_port(ftp_session_t *s, const char *arg)
 
     /* RFC 2577: refuse to open a data connection to anywhere other than the
      * client itself, so the server cannot be used as an "FTP bounce" proxy. */
-    ip_addr_t peer;
-    u16_t peer_port;
-    if (tcp_tcp_get_tcp_addrinfo(s->ctrl_pcb, 0, &peer, &peer_port) != ERR_OK ||
-        ip_addr_get_ip4_u32(&peer) != ip_addr_get_ip4_u32(&addr)) {
+    uint32_t peer_ip;
+    if (ftp_peer_ip(s->ctrl_pcb, &peer_ip) < 0 ||
+        peer_ip != ip_addr_get_ip4_u32(&addr)) {
         ftp_send_reply(s, "501 PORT address must match the control connection.\r\n");
         return;
     }
@@ -1219,8 +1308,7 @@ static void cmd_mkd(ftp_session_t *s, const char *arg)
         ftp_send_reply(s, "550 Create directory failed.\r\n");
         return;
     }
-    (void)snprintf(s_reply, sizeof(s_reply), "257 \"%s\" created.\r\n", path);
-    ftp_send_reply(s, s_reply);
+    ftp_send_257(s, path, " created.\r\n");
 }
 
 static void cmd_rnfr(ftp_session_t *s, const char *arg)
@@ -1336,7 +1424,9 @@ static const struct ftp_cmd ftp_commands[] = {
     {"PASS",     1,   0,   cmd_pass},
     {"QUIT",     1,   0,   cmd_quit},
     {"SYST",     0,   0,   cmd_syst},
-    {"FEAT",     0,   0,   cmd_feat},
+    /* RFC 2389 section 3: FEAT may be issued before login, and clients use it
+     * to decide what to send during the login sequence itself. */
+    {"FEAT",     1,   0,   cmd_feat},
     {"OPTS",     0,   0,   cmd_opts},
     {"NOOP",     0,   0,   cmd_noop},
     {"TYPE",     0,   0,   cmd_type},
@@ -1365,15 +1455,67 @@ static const struct ftp_cmd ftp_commands[] = {
     {"ABOR",     0,   0,   cmd_abor},
 };
 
+/** Telnet IAC and the WILL/WONT/DO/DONT range that carries an option byte. */
+#define FTP_TELNET_IAC  0xFFU
+#define FTP_TELNET_WILL 0xFBU
+#define FTP_TELNET_DONT 0xFEU
+
+/**
+ * Remove Telnet command sequences from the first @p len bytes of @p line,
+ * in place, and NUL-terminate what is left.
+ *
+ * RFC 959 section 4.1 has clients precede a command sent during a transfer
+ * (ABOR above all, also STAT and QUIT) with the Telnet "Interrupt Process"
+ * and "Synch" signals. lwIP does not interpret the urgent pointer, so those
+ * IAC bytes arrive inline: without this the server reads "\xFF\xF4\xFF\xF2ABOR"
+ * and answers 502 to every abort a conforming client sends.
+ *
+ * Works on a length rather than a C string because an option byte may itself
+ * be NUL — IAC DO BINARY is 0xFF 0xFD 0x00 — which would otherwise swallow the
+ * command that follows it. Stray NULs are dropped for the same reason: FTP
+ * commands are Telnet strings of printable characters, so a NUL is never data
+ * here, and letting one truncate the line just loses the rest of it.
+ *
+ * @return the new end of the line, so the caller need not re-measure it.
+ */
+static char *ftp_strip_telnet(char *line, uint16_t len)
+{
+    char *dst = line;
+
+    /* Compaction never outruns the read cursor, so this is safe in place. */
+    for (uint16_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)line[i];
+        if (ch == '\0') continue;
+        if (ch != FTP_TELNET_IAC) {
+            *dst++ = (char)ch;
+            continue;
+        }
+
+        if (i + 1 >= len) break;   /* truncated sequence — drop the lone IAC */
+        unsigned char cmd = (unsigned char)line[i + 1];
+        if (cmd == FTP_TELNET_IAC) {   /* IAC IAC — an escaped 0xFF data byte */
+            *dst++ = (char)FTP_TELNET_IAC;
+            i++;
+            continue;
+        }
+        /* Negotiation verbs are followed by an option byte; every other
+         * command (IP, DM, ...) is the whole two-byte sequence. */
+        i += (cmd >= FTP_TELNET_WILL && cmd <= FTP_TELNET_DONT) ? 2 : 1;
+    }
+
+    *dst = '\0';
+    return dst;
+}
+
 /**
  * Parse one command from the command buffer and dispatch it.
  */
 static void ftp_process_command(ftp_session_t *s)
 {
-    /* NUL-terminate and strip trailing CR/LF. */
-    s->cmd_buf[s->cmd_len] = '\0';
+    /* Drop Telnet control sequences (this NUL-terminates the line, at or
+     * before cmd_buf[cmd_len]), then strip trailing CR/LF. */
     char *line = s->cmd_buf;
-    char *end  = line + s->cmd_len;
+    char *end  = ftp_strip_telnet(line, s->cmd_len);
     while (end > line && (*(end - 1) == '\r' || *(end - 1) == '\n'))
         *(--end) = '\0';
 
@@ -1396,6 +1538,13 @@ static void ftp_process_command(ftp_session_t *s)
         }
     }
 
+    /* Cancel a pending rename before dispatching, not after the auth gate:
+     * USER, PASS and QUIT are handled pre-auth and would otherwise let an
+     * RNFR survive a re-login and be completed by a later RNTO. */
+    if (!c || !c->keeps_rnfr) {
+        s->rnfr[0] = '\0';
+    }
+
     if (c && c->pre_auth) {
         c->handler(s, arg);
         return;
@@ -1403,9 +1552,6 @@ static void ftp_process_command(ftp_session_t *s)
     if (s->auth != FTP_STATE_LOGGED_IN) {
         ftp_send_reply(s, "530 Please login with USER and PASS.\r\n");
         return;
-    }
-    if (!c || !c->keeps_rnfr) {
-        s->rnfr[0] = '\0';
     }
     if (!c) {
         ftp_send_reply(s, "502 Command not implemented.\r\n");
@@ -1444,10 +1590,12 @@ static int ftp_consume_lines(ftp_session_t *s)
              * below, which resynchronises on the next line. */
             s->discard_line = 0;
         } else {
-            /* ftp_process_command() writes a NUL at cmd_buf[line_len]; when
-             * more data follows in the buffer (pipelined commands in one TCP
-             * segment) that byte belongs to the next queued line, so it must
-             * be preserved and restored instead of permanently clobbered. */
+            /* ftp_process_command() terminates the line at or before
+             * cmd_buf[line_len] (before it, if Telnet sequences were
+             * stripped); when more data follows in the buffer (pipelined
+             * commands in one TCP segment) that byte belongs to the next
+             * queued line, so it is preserved and restored either way rather
+             * than risk being clobbered. */
             uint8_t has_next  = (line_len < total_len);
             char    next_byte = (char)(has_next ? s->cmd_buf[line_len] : '\0');
 
@@ -1566,8 +1714,15 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     /* See ftp_data_accept() for why tcp_accepted() is not called here. */
     ftp_session_t *s = ftp_alloc_session();
     if (!s) {
-        tcp_abort(pcb);
-        return ERR_ABRT;
+        /* Say why before hanging up: an aborted connection just looks like a
+         * network fault to the client. tcp_abort() would discard the reply
+         * along with everything else queued, so close instead. */
+        static const char busy[] = "421 Too many users, try again later.\r\n";
+        if (tcp_sndbuf(pcb) >= sizeof(busy) - 1) {
+            (void)tcp_write(pcb, busy, sizeof(busy) - 1, TCP_WRITE_FLAG_COPY);
+            tcp_output(pcb);
+        }
+        return ftp_close_pcb(&pcb, 0) ? ERR_ABRT : ERR_OK;
     }
 
     s->ctrl_pcb = pcb;

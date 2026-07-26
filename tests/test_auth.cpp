@@ -57,6 +57,25 @@ TEST_CASE("an unauthenticated client is refused every real command", "[auth]")
     }
 }
 
+TEST_CASE("FEAT is answered before login", "[auth]")
+{
+    /* RFC 2389 section 3: FEAT may be issued before login — clients use the
+     * feature list to decide what to send during the login sequence itself
+     * (UTF8 above all), so gating it behind USER/PASS is backwards. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "FEAT\r\n") ==
+            "211-Features:\r\n"
+            " PASV\r\n"
+            " SIZE\r\n"
+            " UTF8\r\n"
+            "211 End\r\n");
+
+    /* It grants nothing: everything else still needs credentials. */
+    REQUIRE(send_cmd(c, "PWD\r\n") == "530 Please login with USER and PASS.\r\n");
+}
+
 TEST_CASE("the configured user name is accepted", "[auth]")
 {
     init_server();
