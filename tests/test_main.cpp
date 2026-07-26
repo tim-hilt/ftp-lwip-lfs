@@ -330,7 +330,6 @@ TEST_CASE("informational commands reply with expected content", "[commands]")
     SECTION("FEAT lists supported features") {
         REQUIRE(send_cmd(c, "FEAT\r\n") ==
                 "211-Features:\r\n"
-                " PASV\r\n"
                 " SIZE\r\n"
                 " UTF8\r\n"
                 "211 End\r\n");
@@ -1569,7 +1568,7 @@ TEST_CASE("RETR sends file content over the data connection", "[transfer]")
 
     /* Only binary transfers are implemented, so the mode is always BINARY.
      * The byte count matters — clients use it for progress reporting. */
-    REQUIRE(out.rfind("150 Opening BINARY mode data connection (11 bytes).\r\n", 0) == 0);
+    REQUIRE(out.rfind("150 Opening data connection (11 bytes).\r\n", 0) == 0);
     REQUIRE(out.find("hello world") != std::string::npos);
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
 }
@@ -1642,7 +1641,7 @@ TEST_CASE("a send lwIP cannot queue at all is retried from the data poll",
 
     /* ... the client is promised data and then gets none. */
     REQUIRE(written_since(before) ==
-            "150 Opening BINARY mode data connection (11 bytes).\r\n");
+            "150 Opening data connection (11 bytes).\r\n");
 
     /* When the pool refills and the data poll fires ... */
     REQUIRE(mock_tcp_cb_poll[data_idx] != nullptr);
@@ -1779,7 +1778,14 @@ TEST_CASE("RETR reports a file-size failure rather than announcing it", "[transf
     /* The file opened for the transfer must not be left dangling — a second
      * open of the same handle corrupts littlefs's list of open files. */
     REQUIRE(s_closes == 1);
-    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+
+    /* The PASV listener from before the failed RETR is untouched, so the
+     * client can retry on it directly instead of needing a fresh PASV —
+     * consistent with every other transfer-setup failure (550/450). */
+    REQUIRE(send_cmd(c, "LIST\r\n").empty()); /* async: waits for data conn */
+    u16_t before = mock_tcp_write_len;
+    accept_pasv_data_connection();
+    REQUIRE(written_since(before).rfind("150", 0) == 0);
 }
 
 TEST_CASE("ABOR reports the transfer it cut short", "[transfer]")
@@ -1876,7 +1882,7 @@ TEST_CASE("a data connection accepted before the command still transfers", "[tra
     accept_pasv_data_connection();
 
     std::string out = send_cmd(c, "RETR file.bin\r\n");
-    REQUIRE(out.rfind("150 Opening BINARY", 0) == 0);
+    REQUIRE(out.rfind("150 Opening data connection", 0) == 0);
     REQUIRE(out.find("abcde") != std::string::npos);
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
 }
@@ -2160,7 +2166,7 @@ TEST_CASE("a data poll during a pending connect does not run the transfer",
     before = mock_tcp_write_len;
     REQUIRE(s_cb(mock_tcp_cb_arg[idx], s_pcb, ERR_OK) == ERR_OK);
     std::string out = written_since(before);
-    REQUIRE(out.rfind("150 Opening BINARY mode data connection (5 bytes).\r\n", 0) == 0);
+    REQUIRE(out.rfind("150 Opening data connection (5 bytes).\r\n", 0) == 0);
     REQUIRE(out.find("abcde") != std::string::npos);
     REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
 }

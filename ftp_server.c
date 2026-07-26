@@ -32,7 +32,6 @@
  * the two listing formats that need formatting go through ftp_put_str()/
  * ftp_put_uint() instead, and ftp_parse_port_arg() reads its own digits. */
 #include <string.h>
-#include <ctype.h>
 
 /* The listing formatter reserves the last two bytes of the transfer buffer for
  * the CRLF that terminates an entry, and a reply buffer has to hold at least
@@ -43,6 +42,20 @@
 #endif
 #if FTP_SERVER_PATH_MAX < 16
 #error "FTP_SERVER_PATH_MAX must be at least 16"
+#endif
+/* Below 16, ftp_ctrl_recv()'s `room = FTP_SERVER_CMD_BUF_SIZE - 1 - cmd_len`
+ * can reach 0 with an empty buffer, so no command line — however short —
+ * ever fits and the "500 Command line too long" resync loop never makes
+ * progress: a verified infinite loop, not just a usability floor. */
+#if FTP_SERVER_CMD_BUF_SIZE < 16
+#error "FTP_SERVER_CMD_BUF_SIZE must be at least 16"
+#endif
+/* cmd_pasv()'s search loop below computes
+ * `range = FTP_SERVER_PASV_PORT_MAX - FTP_SERVER_PASV_PORT_MIN + 1`; an
+ * inverted range underflows that to ~65535 and the loop spins re-binding the
+ * same port instead of failing. */
+#if FTP_SERVER_PASV_PORT_MIN > FTP_SERVER_PASV_PORT_MAX
+#error "FTP_SERVER_PASV_PORT_MIN must not exceed FTP_SERVER_PASV_PORT_MAX"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -196,6 +209,7 @@ static void   ftp_data_err(void *arg, err_t err);
 
 static void   ftp_process_command(ftp_session_t *s);
 static void   ftp_send_reply(ftp_session_t *s, const char *msg);
+static void   ftp_release_transfer(ftp_session_t *s);
 static void   ftp_close_data(ftp_session_t *s);
 static void   ftp_close_session(ftp_session_t *s);
 static void   ftp_start_transfer(ftp_session_t *s);
@@ -257,14 +271,27 @@ static char *ftp_put_uint(char *dst, const char *const end, unsigned long val,
     return dst;
 }
 
+/**
+ * Uppercase an ASCII letter, otherwise pass it through unchanged.
+ *
+ * Not <ctype.h>'s toupper(): it was the last non-string.h libc dependency,
+ * and on a typical newlib target it costs a 257-byte locale table plus
+ * __ctype_ptr__ for a table lookup that a two-branch comparison replaces
+ * outright. FTP commands, TYPE/MODE/STRU codes and Telnet option bytes are
+ * all ASCII by definition (RFC 959), so there is no locale to respect. */
+static char ftp_toupper(unsigned char c)
+{
+    return (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : (char)c;
+}
+
 /** Case-insensitive strcmp — strcasecmp is POSIX, not C99. */
 static int ftp_strcasecmp(const char *a, const char *b)
 {
-    while (*a && toupper((unsigned char)*a) == toupper((unsigned char)*b)) {
+    while (*a && ftp_toupper((unsigned char)*a) == ftp_toupper((unsigned char)*b)) {
         a++;
         b++;
     }
-    return toupper((unsigned char)*a) - toupper((unsigned char)*b);
+    return ftp_toupper((unsigned char)*a) - ftp_toupper((unsigned char)*b);
 }
 
 /**
@@ -493,9 +520,13 @@ static ftp_session_t *ftp_alloc_session(void)
 static uint16_t ftp_next_pasv_port(void)
 {
     uint16_t p = s_next_pasv_port;
-    s_next_pasv_port++;
-    if (s_next_pasv_port > FTP_SERVER_PASV_PORT_MAX)
+    /* Compare before incrementing: with FTP_SERVER_PASV_PORT_MAX == 65535,
+     * `s_next_pasv_port++` would wrap to 0 and `> MAX` would never trip,
+     * so the port after 65535 would silently become 0 instead of MIN. */
+    if (s_next_pasv_port >= FTP_SERVER_PASV_PORT_MAX)
         s_next_pasv_port = FTP_SERVER_PASV_PORT_MIN;
+    else
+        s_next_pasv_port++;
     return p;
 }
 
@@ -549,16 +580,39 @@ static void ftp_send_257(ftp_session_t *s, const char *path, const char *tail)
     ftp_send_reply(s, s_reply);
 }
 
+/**
+ * Send a reply built as "@p pre @p val @p post", formatted through s_reply.
+ * Collapses the "char *const end = ...; ...; *dst = '\0'; ftp_send_reply()"
+ * sequence that would otherwise be repeated at every simple numeric reply.
+ */
+static void ftp_send_reply_uint(ftp_session_t *s, const char *pre,
+                                unsigned long val, const char *post)
+{
+    char *const end = s_reply + sizeof(s_reply) - 1;
+    char       *dst = ftp_put_str(s_reply, end, pre);
+    dst = ftp_put_uint(dst, end, val, 0);
+    dst = ftp_put_str(dst, end, post);
+    *dst = '\0';
+    ftp_send_reply(s, s_reply);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Close helpers                                                     */
 /* ------------------------------------------------------------------ */
 
-static void ftp_close_data(ftp_session_t *s)
+/**
+ * Release the resources owned by the *transfer* itself — open file/dir handle,
+ * transfer mode and buffered offsets — without touching the data connection or
+ * PASV listener.
+ *
+ * Split out of ftp_close_data() so a failure that happens before any bytes
+ * moved (e.g. cmd_retr()'s lfs_file_size() check) can disarm the transfer
+ * while leaving an already-open PASV socket up for the client to retry on,
+ * matching every sibling failure path (ftp_open_transfer()'s 550,
+ * ftp_do_list()'s 550, ftp_transfer_busy()'s 450).
+ */
+static void ftp_release_transfer(ftp_session_t *s)
 {
-    if (ftp_close_pcb(&s->data_pcb, 0)) s->data_aborted = 1;
-    (void)ftp_close_pcb(&s->pasv_listen_pcb, 1);
-    s->data_connecting = 0;
-
     if (s->file_open) {
         lfs_file_close(s_lfs, &s->file);
         s->file_open = 0;
@@ -570,6 +624,16 @@ static void ftp_close_data(ftp_session_t *s)
     s->data_mode    = FTP_DATA_IDLE;
     s->data_pending = 0;
     s->data_offset  = 0;
+}
+
+static void ftp_close_data(ftp_session_t *s)
+{
+    if (ftp_close_pcb(&s->data_pcb, 0)) s->data_aborted = 1;
+    (void)ftp_close_pcb(&s->pasv_listen_pcb, 1);
+    s->data_connecting = 0;
+
+    ftp_release_transfer(s);
+
     /* RFC 959: PORT/PASV should be re-issued per transfer. Resetting here
      * is intentionally strict; some clients assume the last PORT persists.
      * If relaxed, also clear port_active in the PASV handler (already done)
@@ -811,16 +875,14 @@ static void ftp_start_transfer(ftp_session_t *s)
     if (s->data_mode == FTP_DATA_STOR) {
         ftp_send_reply(s, "150 Ok to send data.\r\n");
     } else if (s->data_mode == FTP_DATA_RETR) {
-        /* Only binary transfers are implemented (TYPE rejects anything else),
-         * so the mode is a constant. Clients that care parse the byte count.
+        /* Not "BINARY mode": cmd_type() is explicit that TYPE A performs no
+         * conversion either, i.e. the server is byte-transparent regardless
+         * of which type the client selected, so claiming BINARY here would
+         * contradict cmd_type()'s own 200 reply for TYPE A. Clients that care
+         * parse the byte count, not the word between the parens.
          * cmd_retr() has already rejected a negative size. */
-        char *const end = s_reply + sizeof(s_reply) - 1;
-        char       *dst = ftp_put_str(s_reply, end,
-                    "150 Opening BINARY mode data connection (");
-        dst = ftp_put_uint(dst, end, (unsigned long)s->retr_size, 0);
-        dst = ftp_put_str(dst, end, " bytes).\r\n");
-        *dst = '\0';
-        ftp_send_reply(s, s_reply);
+        ftp_send_reply_uint(s, "150 Opening data connection (",
+                           (unsigned long)s->retr_size, " bytes).\r\n");
         ftp_send_next_data(s);
     } else {
         ftp_send_reply(s, "150 Here comes the data.\r\n");
@@ -1105,8 +1167,10 @@ static void cmd_syst(ftp_session_t *s, const char *arg)
 static void cmd_feat(ftp_session_t *s, const char *arg)
 {
     (void)arg;
+    /* RFC 2389 section 3: FEAT lists extensions *beyond* the RFC 959 baseline.
+     * PASV is baseline, not an extension, so it does not belong here even
+     * though the server supports it. */
     ftp_send_reply(s, "211-Features:\r\n"
-                      " PASV\r\n"
                       " SIZE\r\n"
                       " UTF8\r\n"
                       "211 End\r\n");
@@ -1133,7 +1197,7 @@ static void cmd_noop(ftp_session_t *s, const char *arg)
  */
 static int ftp_arg_is_code(const char *arg, char code)
 {
-    return arg && toupper((unsigned char)arg[0]) == code && arg[1] == '\0';
+    return arg && ftp_toupper((unsigned char)arg[0]) == code && arg[1] == '\0';
 }
 
 /**
@@ -1146,7 +1210,7 @@ static int ftp_arg_is_code(const char *arg, char code)
  */
 static void cmd_type(ftp_session_t *s, const char *arg)
 {
-    char code = arg ? (char)toupper((unsigned char)arg[0]) : '\0';
+    char code = arg ? ftp_toupper((unsigned char)arg[0]) : '\0';
     /* ASCII and EBCDIC take an optional format parameter; only the default,
      * Non-print, is meaningful here (section 3.1.1.5.1). */
     int ok = (code == 'A' || code == 'I') &&
@@ -1199,7 +1263,9 @@ static void ftp_set_cwd(ftp_session_t *s, const char *path)
 
 static void cmd_cwd(ftp_session_t *s, const char *arg)
 {
-    const char *path = ftp_arg_path(s, arg, NULL);
+    /* RFC 959 section 4.1.1 makes the pathname mandatory for CWD; an absent
+     * argument is a syntax error (501), not "stay in the current directory". */
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_dir);
     if (!path) return;
 
     struct lfs_info info;
@@ -1410,7 +1476,11 @@ static void cmd_retr(ftp_session_t *s, const char *arg)
      * byte count in the "150" reply. */
     s->retr_size = lfs_file_size(s_lfs, &s->file);
     if (s->retr_size < 0) {
-        ftp_close_data(s);   /* closes the file just opened, disarms the mode */
+        /* Release the file and disarm the mode only — an already-open PASV
+         * listener/data connection is untouched, so the client can retry the
+         * RETR on it instead of getting "425 Use PASV or PORT first" after a
+         * transient 451, matching the other transfer-setup failure paths. */
+        ftp_release_transfer(s);
         ftp_send_reply(s, ftp_reply_local_err);
         return;
     }
@@ -1518,12 +1588,7 @@ static void cmd_size(ftp_session_t *s, const char *arg)
         ftp_send_reply(s, "550 Could not get file size.\r\n");
         return;
     }
-    char *const end = s_reply + sizeof(s_reply) - 1;
-    char       *dst = ftp_put_str(s_reply, end, "213 ");
-    dst = ftp_put_uint(dst, end, (unsigned long)info.size, 0);
-    dst = ftp_put_str(dst, end, "\r\n");
-    *dst = '\0';
-    ftp_send_reply(s, s_reply);
+    ftp_send_reply_uint(s, "213 ", (unsigned long)info.size, "\r\n");
 }
 
 static void cmd_abor(ftp_session_t *s, const char *arg)
@@ -1685,7 +1750,12 @@ static char *ftp_strip_telnet(char *line, uint16_t len)
             continue;
         }
         /* Negotiation verbs are followed by an option byte; every other
-         * command (IP, DM, ...) is the whole two-byte sequence. */
+         * command (IP, DM, ...) is the whole two-byte sequence. RFC 959
+         * section 4.1 only requires IP/DM to be recognised here, so IAC SB
+         * (0xFA) is deliberately handled as a plain two-byte command rather
+         * than skipped through to its IAC SE terminator: a subnegotiation
+         * payload, if a client ever sent one on the command channel, leaks
+         * into the command line instead of being stripped. */
         i += (cmd >= FTP_TELNET_WILL && cmd <= FTP_TELNET_DONT) ? 2 : 1;
     }
 
@@ -1912,9 +1982,13 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     }
 
     s->ctrl_pcb = pcb;
-    /* FTP_SERVER_USER defaults to NULL but is project-configurable (ftp_server.h). */
-    // NOLINTNEXTLINE(misc-redundant-expression)
-    s->auth     = (FTP_SERVER_USER == NULL)
+    /* FTP_SERVER_USER defaults to NULL but is project-configurable
+     * (ftp_server.h). Read through a local rather than compare
+     * FTP_SERVER_USER == NULL directly, the same idiom cmd_user() uses for
+     * the same macro, so clang-tidy's misc-redundant-expression does not
+     * need a suppression on a comparison that is only sometimes redundant. */
+    const char *need_user = FTP_SERVER_USER;
+    s->auth     = (need_user == NULL)
                       ? FTP_STATE_LOGGED_IN
                       : FTP_STATE_WAIT_USER;
 

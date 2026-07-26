@@ -67,7 +67,6 @@ TEST_CASE("FEAT is answered before login", "[auth]")
 
     REQUIRE(send_cmd(c, "FEAT\r\n") ==
             "211-Features:\r\n"
-            " PASV\r\n"
             " SIZE\r\n"
             " UTF8\r\n"
             "211 End\r\n");
