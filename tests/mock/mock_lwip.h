@@ -88,6 +88,15 @@ extern u16_t  mock_tcp_write_len;
  */
 extern u8_t   mock_tcp_track_sndbuf;
 
+/**
+ * When non-NULL, the default tcp_write() fails with ERR_MEM for this one PCB
+ * and behaves normally for every other. Real lwIP does this when the pbuf or
+ * segment pool is empty, and unlike a full send window it queues nothing — so
+ * no ACK, and hence no tcp_sent callback, follows. Set it to make one
+ * connection hit that while the control connection keeps working.
+ */
+extern struct tcp_pcb *mock_tcp_write_memerr_pcb;
+
 /** Give @p pcb another @p len bytes of send window (simulates an ACK). */
 void mock_tcp_ack(struct tcp_pcb *pcb, u16_t len);
 

@@ -1006,9 +1006,14 @@ TEST_CASE("PASV reports socket setup failures", "[pasv]")
     Client c = connect_client();
 
     SECTION("no PCB available") {
-        mock_tcp_new_fn = []() -> struct tcp_pcb * { return nullptr; };
-        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot create data socket.\r\n");
+        static int s_news;
+        s_news = 0;
+        mock_tcp_new_fn = []() -> struct tcp_pcb * { s_news++; return nullptr; };
+        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot open data socket.\r\n");
         mock_tcp_new_fn = nullptr;
+        /* An empty PCB pool will not refill mid-loop, so this must not be
+         * retried once per port in the range. */
+        REQUIRE(s_news == 1);
     }
 
     SECTION("every port in the range is in use") {
@@ -1018,9 +1023,10 @@ TEST_CASE("PASV reports socket setup failures", "[pasv]")
             s_binds++;
             return ERR_USE;
         };
-        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot bind data socket.\r\n");
+        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot open data socket.\r\n");
         mock_tcp_bind_fn = nullptr;
-        /* Every port in the configured range must have been tried. */
+        /* A port collision, unlike an allocation failure, is worth walking the
+         * whole configured range for. */
         REQUIRE(s_binds == FTP_SERVER_PASV_PORT_MAX - FTP_SERVER_PASV_PORT_MIN + 1);
     }
 
@@ -1031,7 +1037,7 @@ TEST_CASE("PASV reports socket setup failures", "[pasv]")
         mock_tcp_listen_with_backlog_fn = [](struct tcp_pcb *, u8_t) -> struct tcp_pcb * {
             return nullptr;
         };
-        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot listen on data socket.\r\n");
+        REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot open data socket.\r\n");
         REQUIRE(s_closed != nullptr);
         mock_tcp_close_fn = nullptr;
         mock_tcp_listen_with_backlog_fn = nullptr;
@@ -1343,6 +1349,60 @@ TEST_CASE("a listing entry longer than the data buffer is truncated cleanly",
     REQUIRE(out.find('\0') == std::string::npos);
 }
 
+TEST_CASE("a listing is not pushed onto the wire one entry at a time",
+          "[transfer][regression]")
+{
+    /* Given a directory of many small entries — each LIST line is ~55 bytes,
+     * so a tcp_output() per entry would hand lwIP no chance to coalesce them
+     * into full segments. */
+    init_server();
+    Client c = connect_client();
+
+    static const int kEntries = 20;
+    mock_lfs_dir_read_fn = [](lfs_t *, lfs_dir_t *, struct lfs_info *info) -> int {
+        static int left = kEntries;
+        if (info == nullptr) { left = kEntries; return 0; }
+        if (left-- <= 0) return 0;
+        std::memset(info, 0, sizeof(*info));
+        info->type = LFS_TYPE_REG;
+        info->size = 123;
+        std::snprintf(info->name, sizeof(info->name), "f%02d.txt", left);
+        return 1;
+    };
+    mock_lfs_dir_read_fn(nullptr, nullptr, nullptr); /* reset */
+
+    static int s_outputs[MOCK_TCP_MAX_PCBS];
+    std::memset(s_outputs, 0, sizeof(s_outputs));
+    mock_tcp_output_fn = [](struct tcp_pcb *pcb) -> err_t {
+        int i = mock_tcp_pcb_index(pcb);
+        if (i >= 0) s_outputs[i]++;
+        return ERR_OK;
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "LIST\r\n").empty());
+
+    u16_t before = mock_tcp_write_len;
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    std::string out = written_since(before);
+    mock_tcp_output_fn = nullptr;
+
+    /* The whole listing did go out ... */
+    size_t entries = 0;
+    for (size_t at = out.find(".txt"); at != std::string::npos;
+         at = out.find(".txt", at + 1)) {
+        entries++;
+    }
+    REQUIRE(entries == kEntries);
+    REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+
+    /* ... queued, but never flushed per entry. Nothing blocked, so the data
+     * channel needed no explicit push at all: the real flush comes from the
+     * tcp_close() in ftp_close_data(), which lwIP's tcp_close_shutdown_fin()
+     * performs itself. */
+    REQUIRE(s_outputs[mock_tcp_pcb_index(data_pcb)] == 0);
+}
+
 /* ==================================================================== */
 /*  RETR                                                                 */
 /* ==================================================================== */
@@ -1425,6 +1485,111 @@ TEST_CASE("RETR resumes when the send window fills up", "[transfer]")
     REQUIRE(err == ERR_OK);
     REQUIRE(rest.rfind(" world", 0) == 0);
     REQUIRE(rest.find("226 Transfer complete.\r\n") != std::string::npos);
+}
+
+TEST_CASE("a send lwIP cannot queue at all is retried from the data poll",
+          "[transfer][regression]")
+{
+    /* Given a RETR whose first data write fails the way an exhausted pbuf pool
+     * fails it — ERR_MEM with nothing queued, so unlike a full send window it
+     * is followed by no ACK and therefore no tcp_sent callback ... */
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
+    g_retr_text = "hello world";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR file.txt\r\n").empty());
+
+    /* Hand-rolled instead of accept_pasv_data_connection() because the PCB has
+     * to be starved between tcp_new() and the accept callback. */
+    struct tcp_pcb *data_pcb = tcp_new();
+    REQUIRE(data_pcb != nullptr);
+    data_pcb->snd_buf = 4096;             /* the window is wide open ... */
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+    mock_tcp_write_memerr_pcb = data_pcb; /* ... but no pbuf can be had */
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_accept[data_idx - 1](mock_tcp_cb_arg[data_idx - 1], data_pcb, ERR_OK);
+
+    /* ... the client is promised data and then gets none. */
+    REQUIRE(written_since(before) ==
+            "150 Opening BINARY mode data connection (11 bytes).\r\n");
+
+    /* When the pool refills and the data poll fires ... */
+    REQUIRE(mock_tcp_cb_poll[data_idx] != nullptr);
+    mock_tcp_write_memerr_pcb = nullptr;
+    before = mock_tcp_write_len;
+    err_t err = mock_tcp_cb_poll[data_idx](mock_tcp_cb_arg[data_idx], data_pcb);
+
+    /* Then the transfer finishes, rather than sitting untouched until the
+     * control-channel idle timeout tears the whole session down. */
+    REQUIRE(err == ERR_OK);
+    REQUIRE(written_since(before) == "hello world226 Transfer complete.\r\n");
+}
+
+TEST_CASE("both kinds of data connection register a poll callback",
+          "[transfer][regression]")
+{
+    /* Given the poll is the only way to retry a send lwIP could not queue,
+     * every path that opens a data connection has to install it. */
+    init_server();
+    Client c = connect_client();
+
+    SECTION("passive mode") {
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+        REQUIRE(mock_tcp_cb_poll[mock_tcp_pcb_index(data_pcb)] != nullptr);
+    }
+
+    SECTION("active mode") {
+        static struct tcp_pcb *s_connect_pcb;
+        s_connect_pcb = nullptr;
+        struct Hook {
+            static err_t fn(struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
+                            tcp_connected_fn)
+            {
+                s_connect_pcb = pcb;
+                return ERR_OK;
+            }
+        };
+        mock_tcp_connect_fn = Hook::fn;
+
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") ==
+                "200 PORT command successful.\r\n");
+        REQUIRE(send_cmd(c, "LIST\r\n").empty()); /* async: awaiting connect */
+        mock_tcp_connect_fn = nullptr;
+
+        REQUIRE(s_connect_pcb != nullptr);
+        REQUIRE(mock_tcp_cb_poll[mock_tcp_pcb_index(s_connect_pcb)] != nullptr);
+    }
+}
+
+TEST_CASE("an idle data poll leaves a transfer alone", "[transfer]")
+{
+    /* A poll that fires while nothing is stuck must not disturb the session,
+     * and must not count as activity — a STOR whose client has gone quiet
+     * still has to reach the idle timeout. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    u16_t before = mock_tcp_write_len;
+    err_t err = mock_tcp_cb_poll[data_idx](mock_tcp_cb_arg[data_idx], data_pcb);
+
+    REQUIRE(err == ERR_OK);
+    REQUIRE(written_since(before).empty());
+
+    /* The upload still completes normally afterwards. */
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
 }
 
 TEST_CASE("a detached data sent callback is a no-op", "[transfer]")
@@ -2402,6 +2567,41 @@ StalledRetr start_stalled_retr()
 }
 
 } // namespace
+
+TEST_CASE("polls during a window-blocked transfer do not resend buffered bytes",
+          "[transfer][regression]")
+{
+    /* Given the poll now fires every couple of seconds for a transfer's whole
+     * life, it repeatedly re-enters a send that is blocked on the send window
+     * rather than on the pbuf pool. That must stay a no-op: data_offset only
+     * advances on a successful write, so nothing may go out twice. */
+    init_server();
+    StalledRetr r = start_stalled_retr(); /* 11 bytes of file, 5-byte window */
+
+    u16_t before = mock_tcp_write_len;
+    for (int i = 0; i < 5; i++) {
+        REQUIRE(mock_tcp_cb_poll[r.data_idx](mock_tcp_cb_arg[r.data_idx],
+                                            r.data_pcb) == ERR_OK);
+    }
+    REQUIRE(written_since(before).empty());
+
+    /* When the peer finally ACKs, the remainder arrives exactly once. */
+    mock_tcp_ack(r.data_pcb, 64);
+    before = mock_tcp_write_len;
+    REQUIRE(mock_tcp_cb_sent[r.data_idx](mock_tcp_cb_arg[r.data_idx],
+                                        r.data_pcb, 5) == ERR_OK);
+    REQUIRE(written_since(before) == " world226 Transfer complete.\r\n");
+    mock_tcp_track_sndbuf = 0;
+
+    /* And no part of the file was duplicated across the whole exchange. */
+    std::string all(mock_tcp_write_buf, mock_tcp_write_len);
+    size_t hellos = 0;
+    for (size_t at = all.find("hello"); at != std::string::npos;
+         at = all.find("hello", at + 1)) {
+        hellos++;
+    }
+    REQUIRE(hellos == 1);
+}
 
 TEST_CASE("a download the client abandons is reported as aborted, not complete",
           "[transfer]")

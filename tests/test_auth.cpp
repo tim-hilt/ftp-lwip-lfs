@@ -84,20 +84,61 @@ TEST_CASE("the configured user name is accepted", "[auth]")
     REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
 }
 
+/** The reply a USER command that names nobody gets in this build. */
+constexpr const char *kUnknownUserReply =
+    kPasswordRequired ? "331 Please specify the password.\r\n"
+                      : "530 Login incorrect.\r\n";
+
 TEST_CASE("an unknown user name is rejected", "[auth]")
 {
     init_server();
     Client c = connect_client();
 
-    REQUIRE(send_cmd(c, "USER intruder\r\n") == "530 Login incorrect.\r\n");
+    REQUIRE(send_cmd(c, "USER intruder\r\n") == kUnknownUserReply);
     REQUIRE(send_cmd(c, "SYST\r\n") == "530 Please login with USER and PASS.\r\n");
+
+    if constexpr (kPasswordRequired) {
+        /* The 331 promised nothing: no password gets in on a bad name, not
+         * even the configured one. */
+        REQUIRE(send_cmd(c, std::string("PASS ") + kPass + "\r\n") ==
+                "530 Login incorrect.\r\n");
+        REQUIRE(send_cmd(c, "SYST\r\n") == "530 Please login with USER and PASS.\r\n");
+    }
+}
+
+TEST_CASE("USER does not reveal whether the name exists", "[auth][security]")
+{
+    /* RFC 2577 section 3: with credentials configured there is exactly one
+     * valid user name, so answering a wrong USER differently from the right
+     * one hands it over for free — the attacker then only has to guess the
+     * password. Both must be answered identically and rejected at PASS. */
+    if constexpr (!kPasswordRequired) {
+        SUCCEED("no password configured, so USER must answer conclusively");
+    } else {
+        init_server();
+
+        Client good = connect_client();
+        Client bad  = connect_client();
+
+        std::string good_reply = send_cmd(good, std::string("USER ") + kUser + "\r\n");
+        std::string bad_reply  = send_cmd(bad,  "USER intruder\r\n");
+        REQUIRE(good_reply == bad_reply);
+        REQUIRE(good_reply == "331 Please specify the password.\r\n");
+
+        /* The distinction survives where it belongs — in what PASS does. */
+        REQUIRE(send_cmd(bad, std::string("PASS ") + kPass + "\r\n") ==
+                "530 Login incorrect.\r\n");
+        REQUIRE(send_cmd(good, std::string("PASS ") + kPass + "\r\n") ==
+                "230 Login successful.\r\n");
+    }
 }
 
 TEST_CASE("USER without an argument is rejected", "[auth]")
 {
     init_server();
     Client c = connect_client();
-    REQUIRE(send_cmd(c, "USER\r\n") == "530 Login incorrect.\r\n");
+    REQUIRE(send_cmd(c, "USER\r\n") == kUnknownUserReply);
+    REQUIRE(send_cmd(c, "SYST\r\n") == "530 Please login with USER and PASS.\r\n");
 }
 
 TEST_CASE("PASS before USER is rejected", "[auth]")
@@ -170,9 +211,10 @@ TEST_CASE("a rejected USER drops an established login", "[auth][security]")
     login(c);
     REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
 
-    /* The client asked to become somebody else and was refused, so it must
-     * not keep the session it already had. */
-    REQUIRE(send_cmd(c, "USER intruder\r\n") == "530 Login incorrect.\r\n");
+    /* The client asked to become somebody else, so it must not keep the
+     * session it already had — whether the refusal lands on this USER or is
+     * deferred to the PASS that has to follow it. */
+    REQUIRE(send_cmd(c, "USER intruder\r\n") == kUnknownUserReply);
     REQUIRE(send_cmd(c, "PWD\r\n") == "530 Please login with USER and PASS.\r\n");
 
     /* Logging back in as the configured user still works. */

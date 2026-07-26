@@ -54,6 +54,7 @@ static int            s_pcb_next;
 char   mock_tcp_write_buf[MOCK_TCP_WRITE_CAPTURE_SIZE];
 u16_t  mock_tcp_write_len;
 u8_t   mock_tcp_track_sndbuf;
+struct tcp_pcb *mock_tcp_write_memerr_pcb;
 
 void mock_tcp_ack(struct tcp_pcb *pcb, u16_t len)
 {
@@ -122,6 +123,7 @@ void mock_lwip_reset(void)
     memset(mock_tcp_write_buf, 0, sizeof(mock_tcp_write_buf));
     mock_tcp_write_len    = 0;
     mock_tcp_track_sndbuf = 0;
+    mock_tcp_write_memerr_pcb = NULL;
 
     /* Callback arrays */
     memset(mock_tcp_cb_arg,    0, sizeof(mock_tcp_cb_arg));
@@ -237,6 +239,8 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *dataptr,
 
     /* Default: append to capture buffer. */
     (void)apiflags;
+    /* Pool exhaustion: nothing is queued, so no ACK will follow. */
+    if (pcb && pcb == mock_tcp_write_memerr_pcb) return ERR_MEM;
     if (mock_tcp_track_sndbuf && pcb) {
         if (pcb->snd_buf < len) return ERR_MEM;
         pcb->snd_buf = (u16_t)(pcb->snd_buf - len);

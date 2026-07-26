@@ -101,7 +101,7 @@ Then connect with any standard FTP client:
 ftp <device-ip>
 ```
 
-If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credentials; otherwise any `USER`/`PASS` is accepted.
+If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credentials; otherwise any `USER`/`PASS` is accepted. With both defined, a wrong username is not rejected until `PASS` — see the note on RFC 2577 §3 below.
 
 ## Notes
 
@@ -112,6 +112,9 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 - Telnet control sequences are stripped from the control connection before a command is parsed. RFC 959 §4.1 has clients precede an in-transfer command with `IAC IP` + `IAC DM`, and lwIP delivers those bytes inline, so without this every conforming `ABOR` would read as an unknown command.
 - Both data-connection directions are pinned to the client ([RFC 2577](https://www.rfc-editor.org/rfc/rfc2577)): `PORT` only accepts the control connection's own peer address (FTP-bounce mitigation, `501` otherwise), and a `PASV` data connection arriving from any other host is dropped, so nobody on the network can race the client onto the passive port and take over the transfer. If the peer cannot be determined, both fail closed.
 - `FEAT` is answered before login (RFC 2389 §3) — clients use the feature list to decide what to send during the login sequence. Everything else except `USER`, `PASS` and `QUIT` needs credentials.
+- When both `FTP_SERVER_USER` and `FTP_SERVER_PASS` are configured, every `USER` is answered `331` and the verdict is deferred to `PASS` ([RFC 2577](https://www.rfc-editor.org/rfc/rfc2577) §3). There is only ever one valid user name, so rejecting a wrong one at `USER` would hand it to an attacker for free. With `FTP_SERVER_USER` alone there is no later step to defer to, and `USER` necessarily answers `230`/`530` outright.
+- A send that lwIP cannot queue at all is retried from a `tcp_poll` on the data connection. `tcp_write()` returns `ERR_MEM` both for a full send window — where the peer's ACK brings the `tcp_sent` callback along to resume the transfer — and for an exhausted pbuf/segment pool, where it queues nothing, so no ACK and no `tcp_sent` ever follow. Without the poll a `RETR`/`LIST` unlucky enough to hit the second case would sit untouched until the idle timeout killed the whole session.
+- Listing entries are queued with one `tcp_write()` each but pushed with a single `tcp_output()`, so lwIP can coalesce a directory's worth of ~55-byte lines into full segments instead of dribbling out one per entry.
 - A pending `RNFR` is cancelled by any intervening command, including `USER`, `PASS` and `QUIT`, so a rename cannot survive a re-login and be completed under different credentials.
 - Pathnames in `257` replies (`PWD`, `MKD`) are quoted with the RFC 959 Appendix II quote-doubling convention, so a name containing `"` still parses.
 - A connection arriving with every session slot taken is answered `421 Too many users, try again later.` and closed, rather than reset.

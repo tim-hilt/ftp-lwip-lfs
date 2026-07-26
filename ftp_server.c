@@ -47,7 +47,8 @@ typedef enum {
 /** Session state machine. WAIT_USER is 0, so a zeroed session is logged out. */
 typedef enum {
     FTP_STATE_WAIT_USER,     /**< sent greeting, expect USER */
-    FTP_STATE_WAIT_PASS,     /**< got USER, expect PASS */
+    FTP_STATE_WAIT_PASS,     /**< got a known USER, expect PASS */
+    FTP_STATE_WAIT_PASS_BAD, /**< got an unknown USER; PASS will be refused */
     FTP_STATE_LOGGED_IN,     /**< authenticated, accept commands */
 } ftp_auth_state_t;
 
@@ -176,6 +177,7 @@ static err_t  ftp_ctrl_poll(void *arg, struct tcp_pcb *pcb);
 static err_t  ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err);
 static err_t  ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);
 static err_t  ftp_data_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
+static err_t  ftp_data_poll(void *arg, struct tcp_pcb *pcb);
 static void   ftp_data_err(void *arg, err_t err);
 
 static void   ftp_process_command(ftp_session_t *s);
@@ -238,6 +240,39 @@ static int ftp_close_pcb(struct tcp_pcb **ppcb, int listener)
     if (listener) return 0;
     tcp_abort(pcb);
     return 1;
+}
+
+/**
+ * tcp_new() + tcp_bind() + tcp_listen() on @p port, cleaning up after itself
+ * at whichever step fails.
+ *
+ * @param err Receives the failing step's error: ERR_MEM when a PCB could not
+ *            be allocated, otherwise tcp_bind()'s error (ERR_USE for a port
+ *            that is already taken). Untouched on success.
+ * @return the listening PCB, or NULL with nothing left allocated.
+ */
+static struct tcp_pcb *ftp_listen_on(uint16_t port, err_t *err)
+{
+    struct tcp_pcb *pcb = tcp_new();
+    if (!pcb) {
+        *err = ERR_MEM;
+        return NULL;
+    }
+
+    *err = tcp_bind(pcb, IP_ADDR_ANY, port);
+    if (*err != ERR_OK) {
+        tcp_close(pcb);
+        return NULL;
+    }
+
+    /* tcp_listen() consumes `pcb` and returns a fresh listening PCB on
+     * success; on failure `pcb` is untouched and still ours to free. */
+    struct tcp_pcb *lpcb = tcp_listen(pcb);
+    if (!lpcb) {
+        tcp_close(pcb);
+        *err = ERR_MEM;
+    }
+    return lpcb;
 }
 
 /**
@@ -522,9 +557,19 @@ static int ftp_transfer_busy(ftp_session_t *s)
 /*  Data transfer: send file or listing data                          */
 /* ------------------------------------------------------------------ */
 
+/** True for the modes ftp_send_next_data() knows how to feed. */
+static int ftp_mode_is_send(ftp_data_mode_t mode)
+{
+    return mode == FTP_DATA_RETR || mode == FTP_DATA_LIST ||
+           mode == FTP_DATA_NLST;
+}
+
 /**
  * Attempt to flush all pending bytes in data_buf[data_offset..) to the
  * data PCB.
+ *
+ * Queues only — the caller owns the tcp_output(), so a whole directory listing
+ * is handed to lwIP before anything is pushed onto the wire.
  *
  * @return 1 when fully flushed (data_pending == 0);
  *         0 when blocked on send buffer space — the caller must return and
@@ -533,15 +578,13 @@ static int ftp_transfer_busy(ftp_session_t *s)
  */
 static int ftp_send_pending(ftp_session_t *s)
 {
-    int wrote = 0;
-
     while (s->data_pending > 0) {
         uint16_t space = tcp_sndbuf(s->data_pcb);
         if (space == 0) break; /* wait for sent callback */
         uint16_t to_send = (s->data_pending < space) ? s->data_pending : space;
         err_t err = tcp_write(s->data_pcb, s->data_buf + s->data_offset,
                               to_send, TCP_WRITE_FLAG_COPY);
-        /* ERR_MEM is transient back-pressure and the sent callback will retry;
+        /* ERR_MEM is back-pressure, retried from tcp_sent or ftp_data_poll;
          * anything else (ERR_CONN, ERR_ARG, ...) never resolves on its own, and
          * treating it as back-pressure would hang the transfer until the idle
          * timer fires. */
@@ -549,12 +592,8 @@ static int ftp_send_pending(ftp_session_t *s)
         if (err != ERR_OK)  return -1;
         s->data_offset  += to_send;
         s->data_pending -= to_send;
-        wrote = 1;
     }
 
-    /* One flush per call rather than one per tcp_write: the loop only runs
-     * more than once when the send window is smaller than the chunk. */
-    if (wrote) tcp_output(s->data_pcb);
     return s->data_pending == 0;
 }
 
@@ -626,7 +665,15 @@ static void ftp_send_next_data(ftp_session_t *s)
         /* Flush what is already buffered — leftovers from a previous fill on
          * the first pass, the chunk just filled on later ones. */
         int flushed = ftp_send_pending(s);
-        if (flushed == 0) return;   /* wait for tcp_sent */
+        if (flushed == 0) {
+            /* Push once here rather than once per chunk: a listing is many
+             * small entries, and one tcp_output each would stop lwIP from
+             * coalescing them into full segments. The paths that leave this
+             * loop instead go through ftp_close_data(), and tcp_close()
+             * flushes the queue itself. */
+            tcp_output(s->data_pcb);
+            return;   /* wait for tcp_sent */
+        }
         if (flushed < 0) {
             ftp_close_data(s);
             ftp_send_reply(s, ftp_reply_aborted);
@@ -724,6 +771,7 @@ static void ftp_begin_transfer(ftp_session_t *s)
             tcp_err(pcb, ftp_data_err);
             tcp_recv(pcb, ftp_data_recv);
             tcp_sent(pcb, ftp_data_sent);
+            tcp_poll(pcb, ftp_data_poll, 4); /* ~2 s; see ftp_data_poll() */
 
             /* Publish the PCB *before* connecting: until the connect completes
              * it is still ours to close, and a teardown in between must not
@@ -793,6 +841,7 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     tcp_recv(pcb, ftp_data_recv);
     tcp_sent(pcb, ftp_data_sent);
     tcp_err(pcb, ftp_data_err);
+    tcp_poll(pcb, ftp_data_poll, 4); /* ~2 s; see ftp_data_poll() */
 
     /* Close the listener — only one data connection per transfer. */
     (void)ftp_close_pcb(&s->pasv_listen_pcb, 1);
@@ -896,11 +945,32 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
     s->idle_polls   = 0; /* transfer is making progress */
 
     /* Previous chunk ACK'd — send more data. */
-    if (s->data_mode == FTP_DATA_RETR ||
-        s->data_mode == FTP_DATA_LIST ||
-        s->data_mode == FTP_DATA_NLST) {
-        ftp_send_next_data(s);
-    }
+    if (ftp_mode_is_send(s->data_mode)) ftp_send_next_data(s);
+
+    return s->data_aborted ? ERR_ABRT : ERR_OK;
+}
+
+/**
+ * Retry a send that tcp_write() could not even queue.
+ *
+ * tcp_write() returns ERR_MEM both for a full send window — where the peer's
+ * ACK brings ftp_data_sent() along to resume the transfer — and for an empty
+ * pbuf/segment pool, where it queues nothing at all (tcp_out.c tolerates
+ * snd_queuelen == 0 on its error path). In the second case no ACK is coming
+ * and no tcp_sent will ever fire, so without this the transfer would sit
+ * untouched until the idle timer killed the whole session.
+ *
+ * Deliberately does not reset idle_polls: a transfer that only ever gets here
+ * is making no progress and should still time out.
+ */
+static err_t ftp_data_poll(void *arg, struct tcp_pcb *pcb)
+{
+    ftp_session_t *s = (ftp_session_t *)arg;
+    (void)pcb;
+    if (!s) return ERR_OK;
+    s->data_aborted = 0;
+
+    if (ftp_mode_is_send(s->data_mode)) ftp_send_next_data(s);
 
     return s->data_aborted ? ERR_ABRT : ERR_OK;
 }
@@ -1076,32 +1146,19 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     ftp_abort_transfer(s);
     if (!s->ctrl_pcb) return;
 
-    struct tcp_pcb *pcb = tcp_new();
-    if (!pcb) {
-        ftp_send_reply(s, "421 Cannot create data socket.\r\n");
-        return;
-    }
-
-    uint16_t port = 0;
+    uint16_t port  = 0;
     uint16_t range = FTP_SERVER_PASV_PORT_MAX - FTP_SERVER_PASV_PORT_MIN + 1;
-    err_t err = ERR_USE;
+    struct tcp_pcb *lpcb = NULL;
+    err_t err = ERR_MEM;
     for (uint16_t tries = 0; tries < range; tries++) {
         port = ftp_next_pasv_port();
-        err = tcp_bind(pcb, IP_ADDR_ANY, port);
-        if (err == ERR_OK) break;
+        lpcb = ftp_listen_on(port, &err);
+        /* Only a port collision is worth walking the range for; an exhausted
+         * PCB pool will not refill inside this loop. */
+        if (lpcb || err != ERR_USE) break;
     }
-    if (err != ERR_OK) {
-        tcp_close(pcb);
-        ftp_send_reply(s, "421 Cannot bind data socket.\r\n");
-        return;
-    }
-
-    /* tcp_listen() consumes `pcb` and returns a fresh listening PCB on
-     * success; on failure `pcb` is untouched and still ours to free. */
-    struct tcp_pcb *lpcb = tcp_listen(pcb);
     if (!lpcb) {
-        tcp_close(pcb);
-        ftp_send_reply(s, "421 Cannot listen on data socket.\r\n");
+        ftp_send_reply(s, "421 Cannot open data socket.\r\n");
         return;
     }
 
@@ -1365,37 +1422,52 @@ static void cmd_abor(ftp_session_t *s, const char *arg)
     ftp_send_reply(s, "226 ABOR command successful.\r\n");
 }
 
+/**
+ * Every path below reassigns s->auth, which is what stops a rejected USER from
+ * leaving an earlier successful login standing: the client asked to become
+ * somebody else and must not keep what it already had.
+ */
 static void cmd_user(ftp_session_t *s, const char *arg)
 {
     const char *need_user = FTP_SERVER_USER;
     const char *need_pass = FTP_SERVER_PASS;
 
-    if (need_user != NULL && (!arg || strcmp(arg, need_user) != 0)) {
-        /* A rejected USER must not leave an earlier successful login standing:
-         * the client asked to become somebody else and was refused. */
-        s->auth = FTP_STATE_WAIT_USER;
-        ftp_send_reply(s, ftp_reply_login_bad);
+    if (need_user == NULL) {   /* authentication disabled */
+        s->auth = FTP_STATE_LOGGED_IN;
+        ftp_send_reply(s, ftp_reply_login_ok);
         return;
     }
-    if (need_user != NULL && need_pass != NULL) {
-        s->auth = FTP_STATE_WAIT_PASS;
+
+    int user_ok = (arg != NULL && strcmp(arg, need_user) == 0);
+
+    if (need_pass != NULL) {
+        /* RFC 2577 section 3: answer every USER identically, so that a wrong
+         * name cannot be distinguished from the configured one without also
+         * knowing the password. Rejecting here instead would let an attacker
+         * recover the single valid user name without guessing at it. The
+         * verdict rides along in the state for cmd_pass() to apply. */
+        s->auth = user_ok ? FTP_STATE_WAIT_PASS : FTP_STATE_WAIT_PASS_BAD;
         ftp_send_reply(s, "331 Please specify the password.\r\n");
         return;
     }
-    s->auth = FTP_STATE_LOGGED_IN;
-    ftp_send_reply(s, ftp_reply_login_ok);
+
+    /* No password configured, so there is no later step to defer the answer
+     * to and the reply necessarily reveals whether the name was right. */
+    s->auth = user_ok ? FTP_STATE_LOGGED_IN : FTP_STATE_WAIT_USER;
+    ftp_send_reply(s, user_ok ? ftp_reply_login_ok : ftp_reply_login_bad);
 }
 
 static void cmd_pass(ftp_session_t *s, const char *arg)
 {
-    if (s->auth != FTP_STATE_WAIT_PASS) {
+    if (s->auth != FTP_STATE_WAIT_PASS && s->auth != FTP_STATE_WAIT_PASS_BAD) {
         ftp_send_reply(s, "503 Login with USER first.\r\n");
         return;
     }
-    /* FTP_STATE_WAIT_PASS is only ever entered when FTP_SERVER_PASS is
-     * non-NULL, so a NULL here can only mean a corrupt state. */
+    /* Neither WAIT_PASS state is reachable unless FTP_SERVER_PASS is non-NULL,
+     * so a NULL here can only mean a corrupt state. */
     const char *need_pass = FTP_SERVER_PASS;
-    if (need_pass != NULL && arg && strcmp(arg, need_pass) == 0) {
+    if (s->auth == FTP_STATE_WAIT_PASS && need_pass != NULL &&
+        arg && strcmp(arg, need_pass) == 0) {
         s->auth = FTP_STATE_LOGGED_IN;
         ftp_send_reply(s, ftp_reply_login_ok);
     } else {
@@ -1756,24 +1828,11 @@ err_t ftp_server_init(lfs_t *lfs)
 
     s_next_pasv_port = FTP_SERVER_PASV_PORT_MIN;
 
-    struct tcp_pcb *pcb = tcp_new();
-    if (!pcb) return ERR_MEM;
+    err_t err = ERR_OK;
+    s_listen_pcb = ftp_listen_on(FTP_SERVER_PORT, &err);
+    if (!s_listen_pcb) return err;
 
-    err_t err = tcp_bind(pcb, IP_ADDR_ANY, FTP_SERVER_PORT);
-    if (err != ERR_OK) {
-        tcp_close(pcb);
-        return err;
-    }
-
-    /* On failure tcp_listen() leaves `pcb` allocated and ownership with us. */
-    struct tcp_pcb *lpcb = tcp_listen(pcb);
-    if (!lpcb) {
-        tcp_close(pcb);
-        return ERR_MEM;
-    }
-
-    s_listen_pcb = lpcb;
-    tcp_accept(lpcb, ftp_ctrl_accept);
+    tcp_accept(s_listen_pcb, ftp_ctrl_accept);
 
     return ERR_OK;
 }
