@@ -700,13 +700,16 @@ TEST_CASE("every path-taking command rejects an over-long path", "[fs]")
         REQUIRE(send_cmd(c, std::string(cmd) + " short\r\n") == "550 Path too long.\r\n");
     }
 
-    /* RNTO resolves its path before consulting the pending RNFR. */
+    /* RNTO consults the pending RNFR before it resolves its path, so getting
+     * to its length check needs a rename actually in flight. The RNFR is
+     * given an absolute path so that it still fits from the deep CWD. */
     init_server();
     Client c = connect_client();
     mock_lfs_stat_fn = stat_is_dir;
     std::string long_name(FTP_SERVER_CMD_BUF_SIZE - 4 - 2 - 1, 'x');
     REQUIRE(send_cmd(c, "CWD " + long_name + "\r\n") ==
             "250 Directory successfully changed.\r\n");
+    REQUIRE(send_cmd(c, "RNFR /old\r\n") == "350 Ready for RNTO.\r\n");
     REQUIRE(send_cmd(c, "RNTO short\r\n") == "550 Path too long.\r\n");
 }
 
@@ -866,10 +869,14 @@ TEST_CASE("an empty argument is not the current directory", "[fs][security]")
     }
     SECTION("every other path command reports the missing argument") {
         for (const char *cmd : {"MKD \r\n", "RETR \r\n", "STOR \r\n",
-                                "SIZE \r\n", "RNFR \r\n", "RNTO \r\n"}) {
+                                "SIZE \r\n", "RNFR \r\n"}) {
             INFO("command: " << cmd);
             REQUIRE(send_cmd(c, cmd).rfind("501 Specify", 0) == 0);
         }
+        /* RNTO answers 503 unless a rename is already pending, so its
+         * empty-argument handling is only reachable behind an RNFR. */
+        REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
+        REQUIRE(send_cmd(c, "RNTO \r\n").rfind("501 Specify", 0) == 0);
     }
 
     /* Nothing was unlinked, and the working directory still stands. */
@@ -930,7 +937,14 @@ TEST_CASE("RNFR / RNTO rename flow", "[fs]")
     SECTION("RNFR rejects a missing argument") {
         REQUIRE(send_cmd(c, "RNFR\r\n") == "501 Specify file name.\r\n");
     }
-    SECTION("RNTO rejects a missing argument") {
+    SECTION("RNTO reports the sequencing error ahead of a missing argument") {
+        /* With no rename pending the fault is the command sequence, not the
+         * filename, so 503 has to outrank 501 — the client's next move is to
+         * send RNFR, not to retry RNTO with an argument. */
+        REQUIRE(send_cmd(c, "RNTO\r\n") == "503 RNFR required first.\r\n");
+    }
+    SECTION("RNTO rejects a missing argument once a rename is pending") {
+        REQUIRE(send_cmd(c, "RNFR a.txt\r\n") == "350 Ready for RNTO.\r\n");
         REQUIRE(send_cmd(c, "RNTO\r\n") == "501 Specify file name.\r\n");
     }
 }
@@ -1081,6 +1095,54 @@ TEST_CASE("PORT is refused when the client's address is unknown", "[port][securi
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
+TEST_CASE("PORT is refused from a control connection that is not IPv4",
+          "[port][security]")
+{
+    /* PORT can only name an IPv4 host, so it can never legitimately match a
+     * peer of another family. Comparing the two as IPv4 u32s would make
+     * "PORT 0,0,0,0,..." from an IPv6 client match — both sides flatten to
+     * zero — and open a data connection to an address the client does not
+     * own. ip_addr_cmp() compares the type too, so this fails closed. */
+    init_server();
+    Client c = connect_client();
+
+    mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *, int,
+                                          ip_addr_t *addr, u16_t *port) -> err_t {
+        if (addr) IP_ADDR6(addr, 0x0db80120, 0, 0, 0x01000000);
+        if (port) *port = 21;
+        return ERR_OK;
+    };
+    REQUIRE(send_cmd(c, "PORT 0,0,0,0,4,1\r\n") ==
+            "501 PORT address must match the control connection.\r\n");
+    mock_tcp_tcp_get_tcp_addrinfo_fn = nullptr;
+
+    /* And no data channel was armed by the rejected command. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("PASV refuses a control connection it cannot name in a 227",
+          "[pasv][security]")
+{
+    /* The 227 reply carries four IPv4 octets and nothing else, and
+     * ip_addr_get_ip4_u32() renders anything that is not IPv4 as 0.0.0.0 —
+     * which would send the client at the wrong host rather than at this one.
+     * RFC 2428 EPSV is the extension that covers IPv6; it is not implemented,
+     * so the honest answer is to refuse. */
+    init_server();
+    Client c = connect_client();
+
+    mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *, int,
+                                          ip_addr_t *addr, u16_t *port) -> err_t {
+        if (addr) IP_ADDR6(addr, 0x0db80120, 0, 0, 0x01000000);
+        if (port) *port = 21;
+        return ERR_OK;
+    };
+    REQUIRE(send_cmd(c, "PASV\r\n") == "421 Cannot determine server address.\r\n");
+    mock_tcp_tcp_get_tcp_addrinfo_fn = nullptr;
+
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
 TEST_CASE("PASV refuses a data connection from another host", "[pasv][security]")
 {
     /* The passive counterpart of the PORT bounce check (RFC 2577). The
@@ -1099,8 +1161,8 @@ TEST_CASE("PASV refuses a data connection from another host", "[pasv][security]"
         mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *pcb, int local,
                                               ip_addr_t *addr, u16_t *port) -> err_t {
             if (addr) {
-                if (pcb == s_ctrl || local) IP4_ADDR(addr, 192, 168, 1, 1);
-                else                        IP4_ADDR(addr, 10, 0, 0, 7);
+                if (pcb == s_ctrl || local) IP_ADDR4(addr, 192, 168, 1, 1);
+                else                        IP_ADDR4(addr, 10, 0, 0, 7);
             }
             if (port) *port = 21;
             return ERR_OK;
@@ -1111,6 +1173,22 @@ TEST_CASE("PASV refuses a data connection from another host", "[pasv][security]"
         /* Fail closed rather than admit an unverifiable connection. */
         mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *, int, ip_addr_t *,
                                               u16_t *) -> err_t { return ERR_VAL; };
+    }
+
+    SECTION("two different IPv6 peers are not the same host") {
+        /* In a dual-stack lwIP, ip_addr_get_ip4_u32() renders *every* IPv6
+         * address as 0, so a check that flattens both peers to a u32 finds
+         * any two IPv6 hosts equal and hands the transfer to whoever reaches
+         * the passive port first. The comparison has to be type-aware. */
+        mock_tcp_tcp_get_tcp_addrinfo_fn = [](struct tcp_pcb *pcb, int local,
+                                              ip_addr_t *addr, u16_t *port) -> err_t {
+            if (addr) {
+                if (pcb == s_ctrl || local) IP_ADDR6(addr, 0x0db80120, 0, 0, 0x01000000);
+                else                        IP_ADDR6(addr, 0x0db80120, 0, 0, 0x66660000);
+            }
+            if (port) *port = 21;
+            return ERR_OK;
+        };
     }
 
     static struct tcp_pcb *s_aborted;
@@ -1911,18 +1989,31 @@ TEST_CASE("active-mode data connection failures are reported", "[transfer]")
     }
 
     SECTION("tcp_connect refuses immediately") {
-        static struct tcp_pcb *s_aborted;
-        s_aborted = nullptr;
-        mock_tcp_abort_fn = [](struct tcp_pcb *p) { s_aborted = p; };
+        /* One reply, and it is the 425. tcp_connect() leaves the PCB in the
+         * CLOSED state, and tcp_abort() on it would reach ftp_data_err() —
+         * still registered as tcp_err — which answers 426 for a transfer that
+         * was already armed. The client would then read the 426 as the answer
+         * to RETR and match the 425 to whatever it sends next.
+         *
+         * tcp_abort() is deliberately left unhooked so the mock's default
+         * fires tcp_err the way lwIP's tcp_abandon() does; going back to a
+         * bare abort here shows up as a 426 glued in front of this reply. */
+        static struct tcp_pcb *s_closed;
+        s_closed = nullptr;
+        mock_tcp_close_fn = [](struct tcp_pcb *p) -> err_t {
+            s_closed = p;
+            return ERR_OK;
+        };
         mock_tcp_connect_fn = [](struct tcp_pcb *, const ip_addr_t *, u16_t,
                                  tcp_connected_fn) -> err_t { return ERR_RTE; };
 
         REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
         REQUIRE(send_cmd(c, "RETR file.bin\r\n") == "425 Can't open data connection.\r\n");
-        REQUIRE(s_aborted != nullptr);
+        /* Closed, not abandoned. */
+        REQUIRE(s_closed != nullptr);
 
         mock_tcp_connect_fn = nullptr;
-        mock_tcp_abort_fn = nullptr;
+        mock_tcp_close_fn = nullptr;
     }
 
     SECTION("a connect that completes for a session that moved on") {

@@ -116,4 +116,10 @@ if(FTP_SERVER_BUILD_TESTS)
     ftp_add_server_library(ftp_server_short_path FTP_SERVER_PATH_MAX=64)
     ftp_add_test_executable(ftp_tests_short_path tests/test_path_limits.cpp
         ftp_server_short_path)
+
+    # Short transfer buffer — see tests/test_list_truncation.cpp. A LIST line
+    # cannot overflow the default 512-byte buffer with LFS_NAME_MAX at 255.
+    ftp_add_server_library(ftp_server_short_data FTP_SERVER_DATA_BUF_SIZE=64)
+    ftp_add_test_executable(ftp_tests_short_data tests/test_list_truncation.cpp
+        ftp_server_short_data)
 endif()

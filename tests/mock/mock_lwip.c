@@ -275,7 +275,30 @@ err_t tcp_close(struct tcp_pcb *pcb)
 void tcp_abort(struct tcp_pcb *pcb)
 {
     if (mock_tcp_abort_fn) { mock_tcp_abort_fn(pcb); return; }
-    (void)pcb;
+
+    /* Real lwIP: tcp_abort() -> tcp_abandon() -> tcp_free(), then
+     * TCP_EVENT_ERR(), which invokes the registered tcp_err callback. The
+     * raw-callback build fires it unconditionally — the last_state guard only
+     * exists in the LWIP_EVENT_API variant (tcp_priv.h) — so an abort path
+     * that forgot to detach its callbacks first re-enters the application.
+     * Swallowing that here would hide exactly the class of bug the abort
+     * bookkeeping in ftp_server.c exists to get right. */
+    int i = mock_tcp_pcb_index(pcb);
+    if (i < 0) return;
+
+    tcp_err_fn errf = mock_tcp_cb_err[i];
+    void      *arg  = mock_tcp_cb_arg[i];
+
+    /* The PCB is freed before the callback runs, so nothing may be delivered
+     * to it afterwards; a test driving a stale callback should see NULL. */
+    mock_tcp_cb_arg[i]    = NULL;
+    mock_tcp_cb_accept[i] = NULL;
+    mock_tcp_cb_recv[i]   = NULL;
+    mock_tcp_cb_sent[i]   = NULL;
+    mock_tcp_cb_err[i]    = NULL;
+    mock_tcp_cb_poll[i]   = NULL;
+
+    if (errf) errf(arg, ERR_ABRT);
 }
 
 /* ------------------------------------------------------------------ */
@@ -289,7 +312,7 @@ err_t tcp_tcp_get_tcp_addrinfo(struct tcp_pcb *pcb, int local,
         return mock_tcp_tcp_get_tcp_addrinfo_fn(pcb, local, addr, port);
     /* Default: return 192.168.1.1:21. */
     (void)pcb; (void)local;
-    if (addr) IP4_ADDR(addr, 192,168,1,1);
+    if (addr) IP_ADDR4(addr, 192,168,1,1);
     if (port) *port = 21;
     return ERR_OK;
 }

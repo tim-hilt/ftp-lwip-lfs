@@ -76,6 +76,27 @@ TEST_CASE("FEAT is answered before login", "[auth]")
     REQUIRE(send_cmd(c, "PWD\r\n") == "530 Please login with USER and PASS.\r\n");
 }
 
+TEST_CASE("OPTS is answered before login", "[auth]")
+{
+    /* The other half of the FEAT exchange. Clients read UTF8 out of the
+     * feature list and immediately act on it — the standard opening is FEAT,
+     * then OPTS UTF8 ON, then USER — so answering 530 here rejects a client
+     * for doing exactly what FEAT invited it to do. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "OPTS UTF8 ON\r\n") == "200 UTF8 set to on.\r\n");
+
+    /* Still no credentials granted, and a bad option is still a 501 rather
+     * than a login complaint. */
+    REQUIRE(send_cmd(c, "OPTS NOPE\r\n") == "501 Option not understood.\r\n");
+    REQUIRE(send_cmd(c, "PWD\r\n") == "530 Please login with USER and PASS.\r\n");
+
+    /* And the login sequence that follows it still works. */
+    login(c);
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
+}
+
 TEST_CASE("the configured user name is accepted", "[auth]")
 {
     init_server();

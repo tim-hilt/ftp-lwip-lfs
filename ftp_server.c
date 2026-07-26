@@ -276,17 +276,20 @@ static struct tcp_pcb *ftp_listen_on(uint16_t port, err_t *err)
 }
 
 /**
- * Fetch the remote IPv4 address of @p pcb.
+ * Fetch the remote address of @p pcb.
+ *
+ * Hands back the whole ip_addr_t rather than an IPv4 u32 on purpose: the
+ * callers compare it with ip_addr_cmp(), and ip_addr_get_ip4_u32() yields 0
+ * for *every* IPv6 address in a dual-stack build (lwip/ip_addr.h), which would
+ * make any two IPv6 peers compare equal and defeat the RFC 2577 checks below.
  *
  * @return 0 on success, -1 if the peer cannot be determined.
  */
-static int ftp_peer_ip(struct tcp_pcb *pcb, uint32_t *ip)
+static int ftp_peer_addr(struct tcp_pcb *pcb, ip_addr_t *addr)
 {
-    ip_addr_t addr;
-    u16_t     port;
-    if (!pcb || tcp_tcp_get_tcp_addrinfo(pcb, 0, &addr, &port) != ERR_OK)
+    u16_t port;
+    if (!pcb || tcp_tcp_get_tcp_addrinfo(pcb, 0, addr, &port) != ERR_OK)
         return -1;
-    *ip = ip_addr_get_ip4_u32(&addr);
     return 0;
 }
 
@@ -417,7 +420,8 @@ static ftp_session_t *ftp_alloc_session(void)
             /* The rest of file_cfg stays zeroed for the session's lifetime;
              * only the no-heap cache buffer has to be pointed at. */
             s->file_cfg.buffer = s->file_cache;
-            strcpy(s->cwd, "/");
+            /* The memset above already supplied the terminator. */
+            s->cwd[0] = '/';
             return s;
         }
     }
@@ -646,8 +650,15 @@ static int ftp_fill_next_chunk(ftp_session_t *s)
         if (n < 0) return FTP_CHUNK_ERR;
         /* snprintf returns the length it *would* have written; on truncation
          * only FTP_SERVER_DATA_BUF_SIZE - 1 bytes are real, the last slot
-         * holding the NUL terminator. */
-        if (n >= (int)FTP_SERVER_DATA_BUF_SIZE) n = (int)FTP_SERVER_DATA_BUF_SIZE - 1;
+         * holding the NUL terminator. Put the CRLF back after clamping: it is
+         * the first thing truncation drops, and without it the shortened name
+         * runs into the following entry and the client parses one mangled
+         * line instead of two. */
+        if (n >= (int)FTP_SERVER_DATA_BUF_SIZE) {
+            n = (int)FTP_SERVER_DATA_BUF_SIZE - 1;
+            s->data_buf[n - 2] = '\r';
+            s->data_buf[n - 1] = '\n';
+        }
         return n;
     }
 }
@@ -783,12 +794,16 @@ static void ftp_begin_transfer(ftp_session_t *s)
                 /* ftp_data_connected() will call ftp_start_transfer(). */
                 return;
             }
-            s->data_pcb        = NULL;
-            s->data_connecting = 0;
-            tcp_abort(pcb);
+            /* tcp_connect() leaves the PCB in the CLOSED state on every
+             * failure path (tcp.c), where tcp_close() just unlinks and frees
+             * it. Letting ftp_close_data() do that is what keeps the reply
+             * single: it detaches ftp_data_err() first, whereas a bare
+             * tcp_abort() here would re-enter it through TCP_EVENT_ERR —
+             * which the raw-callback build fires unconditionally — and emit a
+             * spurious 426 ahead of the 425 below. */
         }
-        ftp_send_reply(s, ftp_reply_no_data);
         ftp_close_data(s);
+        ftp_send_reply(s, ftp_reply_no_data);
         return;
     }
 
@@ -824,10 +839,11 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
      * who can reach the passive port may race the real client onto it and
      * take delivery of a RETR (or supply the contents of a STOR). Leave the
      * listener open so the genuine client can still connect. */
-    uint32_t ctrl_ip;
-    uint32_t data_ip;
-    if (ftp_peer_ip(s->ctrl_pcb, &ctrl_ip) < 0 ||
-        ftp_peer_ip(pcb, &data_ip) < 0 || ctrl_ip != data_ip) {
+    ip_addr_t ctrl_addr;
+    ip_addr_t data_addr;
+    if (ftp_peer_addr(s->ctrl_pcb, &ctrl_addr) < 0 ||
+        ftp_peer_addr(pcb, &data_addr) < 0 ||
+        !ip_addr_cmp(&ctrl_addr, &data_addr)) {
         tcp_abort(pcb);
         return ERR_ABRT;
     }
@@ -1169,9 +1185,15 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     /* Build reply with the server's IP from the control connection. */
     ip_addr_t local_ip;
     u16_t local_port;
-    if (tcp_tcp_get_tcp_addrinfo(s->ctrl_pcb, 1, &local_ip, &local_port) != ERR_OK) {
+    if (tcp_tcp_get_tcp_addrinfo(s->ctrl_pcb, 1, &local_ip, &local_port) != ERR_OK ||
+        !IP_IS_V4(&local_ip)) {
         /* local_ip is untouched on failure — advertising it would send the
-         * client at a garbage address. */
+         * client at a garbage address. The 227 reply can only carry four
+         * IPv4 octets, and ip_addr_get_ip4_u32() flattens anything else to
+         * 0.0.0.0, so a control connection that is not IPv4 has to be refused
+         * rather than answered with a bogus address. (RFC 2428 EPSV is the
+         * extension that covers IPv6; it is not implemented.) IP_IS_V4 is a
+         * constant 1 in an IPv4-only lwIP, so this costs nothing there. */
         ftp_close_data(s);
         ftp_send_reply(s, "421 Cannot determine server address.\r\n");
         return;
@@ -1217,10 +1239,13 @@ static void cmd_port(ftp_session_t *s, const char *arg)
                     (unsigned int)fields[2], (unsigned int)fields[3]);
 
     /* RFC 2577: refuse to open a data connection to anywhere other than the
-     * client itself, so the server cannot be used as an "FTP bounce" proxy. */
-    uint32_t peer_ip;
-    if (ftp_peer_ip(s->ctrl_pcb, &peer_ip) < 0 ||
-        peer_ip != ip_addr_get_ip4_u32(&addr)) {
+     * client itself, so the server cannot be used as an "FTP bounce" proxy.
+     * ip_addr_cmp() takes the address type into account, so a control
+     * connection that is not IPv4 can never match the v4 address parsed above
+     * and PORT is refused outright — which is correct, since the PORT syntax
+     * cannot name a non-IPv4 host in the first place. */
+    ip_addr_t peer;
+    if (ftp_peer_addr(s->ctrl_pcb, &peer) < 0 || !ip_addr_cmp(&peer, &addr)) {
         ftp_send_reply(s, "501 PORT address must match the control connection.\r\n");
         return;
     }
@@ -1385,13 +1410,16 @@ static void cmd_rnfr(ftp_session_t *s, const char *arg)
 
 static void cmd_rnto(ftp_session_t *s, const char *arg)
 {
-    const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
-    if (!path) return;
-
+    /* Checked before the argument is resolved: a bare RNTO with no rename
+     * pending is a sequencing error (503), not a missing-filename one. */
     if (s->rnfr[0] == '\0') {
         ftp_send_reply(s, "503 RNFR required first.\r\n");
         return;
     }
+
+    const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
+    if (!path) return;
+
     if (lfs_rename(s_lfs, s->rnfr, path) < 0) {
         ftp_send_reply(s, "550 Rename failed.\r\n");
     } else {
@@ -1497,9 +1525,12 @@ static const struct ftp_cmd ftp_commands[] = {
     {"QUIT",     1,   0,   cmd_quit},
     {"SYST",     0,   0,   cmd_syst},
     /* RFC 2389 section 3: FEAT may be issued before login, and clients use it
-     * to decide what to send during the login sequence itself. */
+     * to decide what to send during the login sequence itself. OPTS is the
+     * other half of that exchange — the usual opening is FEAT, then
+     * "OPTS UTF8 ON", then USER — so it has to be reachable at the same
+     * point or the client is answered 530 for acting on what FEAT told it. */
     {"FEAT",     1,   0,   cmd_feat},
-    {"OPTS",     0,   0,   cmd_opts},
+    {"OPTS",     1,   0,   cmd_opts},
     {"NOOP",     0,   0,   cmd_noop},
     {"TYPE",     0,   0,   cmd_type},
     {"MODE",     0,   0,   cmd_mode},
