@@ -2,8 +2,8 @@
  * @file ftp_server.c
  * @brief FTP server implementation using LwIP raw TCP API and LittleFS.
  *
- * Supports: USER, PASS, SYST, FEAT, TYPE, PWD, CWD, CDUP, PASV, PORT,
- *           LIST, NLST, RETR, STOR, DELE, MKD, RMD, RNFR, RNTO, SIZE,
+ * Supports: USER, PASS, SYST, FEAT, TYPE, MODE, STRU, PWD, CWD, CDUP, PASV,
+ *           PORT, LIST, NLST, RETR, STOR, DELE, MKD, RMD, RNFR, RNTO, SIZE,
  *           NOOP, QUIT, ABOR.
  *
  * Data transfers use passive mode (PASV) or active mode (PORT).
@@ -245,39 +245,18 @@ static int ftp_close_pcb(struct tcp_pcb **ppcb, int listener)
 /* ------------------------------------------------------------------ */
 
 /**
- * Build an absolute path from the session CWD and a user-supplied argument.
- * Result is written to @p out (size FTP_SERVER_PATH_MAX).
- * Returns 0 on success, -1 on overflow.
+ * Append the components of @p src to the normalised absolute path being built
+ * in @p out, resolving "." and "..", collapsing runs of '/', and leaving a
+ * trailing '/' after every component for the caller to strip.
+ *
+ * @param pdst In/out write cursor; @p out[0] is already the leading '/'.
+ * @return 0 on success, -1 if the result would not fit in FTP_SERVER_PATH_MAX.
  */
-static int ftp_resolve_path(const ftp_session_t *s, const char *arg, char *out)
+static int ftp_append_path(const char *src, char *out, char **pdst)
 {
-    if (!arg || arg[0] == '\0') {
-        ftp_strlcpy(out, s->cwd, FTP_SERVER_PATH_MAX);
-        return 0;
-    }
-
-    char tmp[FTP_SERVER_PATH_MAX];
-    if (arg[0] == '/') {
-        /* Absolute path. Truncating here would silently address a *different*
-         * existing path (a prefix of the requested one), so reject instead. */
-        if (strlen(arg) >= sizeof(tmp)) return -1;
-        ftp_strlcpy(tmp, arg, sizeof(tmp));
-    } else {
-        /* Relative to cwd */
-        int n = snprintf(tmp, sizeof(tmp), "%s%s%s",
-                         s->cwd,
-                         (s->cwd[strlen(s->cwd) - 1] == '/') ? "" : "/",
-                         arg);
-        if (n < 0 || (size_t)n >= sizeof(tmp))
-            return -1;
-    }
-
-    /* Normalise: resolve "." and ".." components, collapse "//" */
-    const char *src = tmp;
-    char *dst = out;
+    char *dst = *pdst;
     char *end = out + FTP_SERVER_PATH_MAX - 1;
 
-    *dst++ = '/';
     while (*src) {
         /* skip slashes */
         while (*src == '/') src++;
@@ -301,12 +280,44 @@ static int ftp_resolve_path(const ftp_session_t *s, const char *arg, char *out)
             continue;
         }
 
-        /* copy component */
-        if (dst + len + 1 > end) return -1;
+        /* copy component. Overflowing would silently address a *different*
+         * existing path (a prefix of the requested one), so reject instead. */
+        if (dst + len + 1 > end) {
+            *pdst = dst;
+            return -1;
+        }
         memcpy(dst, comp, len);
         dst += len;
         *dst++ = '/';
     }
+
+    *pdst = dst;
+    return 0;
+}
+
+/**
+ * Build an absolute path from the session CWD and a user-supplied argument.
+ * Result is written to @p out (size FTP_SERVER_PATH_MAX).
+ * Returns 0 on success, -1 on overflow.
+ *
+ * The CWD and the argument are normalised straight into @p out rather than
+ * concatenated first, so no FTP_SERVER_PATH_MAX-sized frame lands on the
+ * (scarce) MCU stack — the same reason s_path and s_reply are static.
+ */
+static int ftp_resolve_path(const ftp_session_t *s, const char *arg, char *out)
+{
+    char *dst = out;
+    *dst++ = '/';
+
+    /* An absent argument means "the CWD itself"; a relative one starts from
+     * the CWD; an absolute one ignores it. */
+    if (!arg || arg[0] == '\0') {
+        arg = s->cwd;
+    } else if (arg[0] != '/' && ftp_append_path(s->cwd, out, &dst) < 0) {
+        return -1;
+    }
+
+    if (ftp_append_path(arg, out, &dst) < 0) return -1;
 
     /* remove trailing '/' unless root */
     if (dst > out + 1 && *(dst - 1) == '/') dst--;
@@ -716,10 +727,9 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_ABRT;
     }
 
-    /* Tell lwIP the backlog slot is free again; without this a build with
-     * TCP_LISTEN_BACKLOG enabled stops accepting after `backlog` connections. */
-    tcp_accepted(s->pasv_listen_pcb);
-
+    /* No tcp_accepted() here on purpose: lwIP calls tcp_backlog_accepted()
+     * itself immediately before invoking this callback (tcp_in.c), and
+     * tcp_accepted() is now only a no-op compatibility macro (tcp.h). */
     s->data_aborted = 0;
     s->data_pcb = pcb;
     tcp_arg(pcb, s);
@@ -755,9 +765,22 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * transfer ends; for a download it means the client gave up partway,
          * and answering 226 would report a truncated file as complete. */
         ftp_data_mode_t mode = s->data_mode;
+
+        /* littlefs buffers writes and only flushes the tail of the file from
+         * lfs_file_close(), so a full volume or a failing block device on the
+         * last chunk surfaces *here* and nowhere else. Closing through
+         * ftp_close_data(), which discards the result, would announce a
+         * truncated upload as complete. */
+        int flush_failed = 0;
+        if (mode == FTP_DATA_STOR && s->file_open) {
+            flush_failed = (lfs_file_close(s_lfs, &s->file) < 0);
+            s->file_open = 0;
+        }
+
         ftp_close_data(s);
         if (mode == FTP_DATA_STOR) {
-            ftp_send_reply(s, ftp_reply_complete);
+            ftp_send_reply(s, flush_failed ? ftp_reply_local_err
+                                           : ftp_reply_complete);
         } else if (mode != FTP_DATA_IDLE) {
             ftp_send_reply(s, ftp_reply_aborted);
         }
@@ -770,8 +793,9 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         for (q = p; q != NULL; q = q->next) {
             lfs_ssize_t w = lfs_file_write(s_lfs, &s->file,
                                            q->payload, q->len);
-            /* A short write means the volume filled up mid-pbuf; accepting it
-             * would silently truncate the uploaded file. */
+            /* littlefs returns either the full count or a negative error —
+             * the latter when a cache flush mid-pbuf hits a full volume.
+             * Accepting it would silently truncate the uploaded file. */
             if (w != (lfs_ssize_t)q->len) {
                 tcp_recved(pcb, p->tot_len);
                 pbuf_free(p);
@@ -878,12 +902,43 @@ static void cmd_noop(ftp_session_t *s, const char *arg)
     ftp_send_reply(s, "200 NOOP ok.\r\n");
 }
 
+/**
+ * Match a transfer-parameter argument against a single Telnet character code,
+ * case-insensitively. TYPE, MODE and STRU all take exactly one such letter.
+ */
+static int ftp_arg_is_code(const char *arg, char code)
+{
+    return arg && toupper((unsigned char)arg[0]) == code && arg[1] == '\0';
+}
+
 static void cmd_type(ftp_session_t *s, const char *arg)
 {
-    if (arg && (arg[0] == 'I' || arg[0] == 'i')) {
+    if (ftp_arg_is_code(arg, 'I')) {
         ftp_send_reply(s, "200 Switching to Binary mode.\r\n");
     } else {
         ftp_send_reply(s, "504 ASCII transfer mode not supported, use binary.\r\n");
+    }
+}
+
+/* RFC 959 section 5.1 puts MODE and STRU in the minimum implementation every
+ * server must accept "for the default values" — Stream and File. Clients that
+ * send them defensively get a 200 instead of a 502 for a no-op. */
+
+static void cmd_mode(ftp_session_t *s, const char *arg)
+{
+    if (ftp_arg_is_code(arg, 'S')) {
+        ftp_send_reply(s, "200 Mode set to S.\r\n");
+    } else {
+        ftp_send_reply(s, "504 Only stream mode is supported.\r\n");
+    }
+}
+
+static void cmd_stru(ftp_session_t *s, const char *arg)
+{
+    if (ftp_arg_is_code(arg, 'F')) {
+        ftp_send_reply(s, "200 Structure set to F.\r\n");
+    } else {
+        ftp_send_reply(s, "504 Only file structure is supported.\r\n");
     }
 }
 
@@ -1285,6 +1340,8 @@ static const struct ftp_cmd ftp_commands[] = {
     {"OPTS",     0,   0,   cmd_opts},
     {"NOOP",     0,   0,   cmd_noop},
     {"TYPE",     0,   0,   cmd_type},
+    {"MODE",     0,   0,   cmd_mode},
+    {"STRU",     0,   0,   cmd_stru},
     {"PWD",      0,   0,   cmd_pwd},
     {"XPWD",     0,   0,   cmd_pwd},
     {"CWD",      0,   0,   cmd_cwd},
@@ -1506,10 +1563,7 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     (void)arg;
     if (err != ERR_OK || !pcb) return ERR_VAL;
 
-    /* Release the listener's backlog slot; a build with TCP_LISTEN_BACKLOG
-     * enabled otherwise stops accepting after `backlog` connections. */
-    tcp_accepted(s_listen_pcb);
-
+    /* See ftp_data_accept() for why tcp_accepted() is not called here. */
     ftp_session_t *s = ftp_alloc_session();
     if (!s) {
         tcp_abort(pcb);

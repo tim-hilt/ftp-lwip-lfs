@@ -103,3 +103,36 @@ TEST_CASE("an over-long relative path is rejected too", "[path]")
     const std::string too_long(FTP_SERVER_PATH_MAX + 8, 'a');
     REQUIRE(send_cmd(c, "DELE " + too_long + "\r\n") == "550 Path too long.\r\n");
 }
+
+TEST_CASE("an absolute path over-long only before normalising is accepted",
+          "[path]")
+{
+    /* The length limit applies to the *resolved* path, and is enforced one
+     * component at a time. "/<dir>/../a.txt" is longer than the buffer as
+     * written, yet every component it keeps fits and it names a path of two
+     * bytes plus a name — rejecting it would be a false positive.
+     *
+     * (A single component that cannot itself be buffered is still rejected,
+     * even if a following ".." would have dropped it again; the normaliser
+     * materialises each component before it can know that.) */
+    init_server();
+    Client c = connect_client();
+
+    static std::string s_removed;
+    s_removed.clear();
+    mock_lfs_stat_fn   = stat_is_reg;
+    mock_lfs_remove_fn = [](lfs_t *, const char *path) -> int {
+        s_removed = path;
+        return 0;
+    };
+
+    /* Longest component that still fits on its own (see the "path that fits"
+     * case above), which makes "/<dir>/../a.txt" overflow only as written. */
+    const std::string dir(FTP_SERVER_PATH_MAX - 3, 'd');
+    const std::string arg = "/" + dir + "/../a.txt";
+    REQUIRE(arg.size() > FTP_SERVER_PATH_MAX);
+
+    REQUIRE(send_cmd(c, "DELE " + arg + "\r\n") ==
+            "250 Delete operation successful.\r\n");
+    REQUIRE(s_removed == "/a.txt");
+}

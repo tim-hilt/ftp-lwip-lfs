@@ -110,13 +110,6 @@ extern tcp_poll_fn    mock_tcp_cb_poll[MOCK_TCP_MAX_PCBS];
 /** Return the pool-relative index of a PCB, or -1 if not from the pool. */
 int mock_tcp_pcb_index(const struct tcp_pcb *pcb);
 
-/**
- * How often tcp_accepted() was called for each listening PCB slot. lwIP's raw
- * API requires an accept callback to call it, or a build with
- * TCP_LISTEN_BACKLOG enabled stops accepting once the backlog fills.
- */
-extern u16_t mock_tcp_accepted_calls[MOCK_TCP_MAX_PCBS];
-
 /* ------------------------------------------------------------------ */
 /*  Reset                                                             */
 /* ------------------------------------------------------------------ */

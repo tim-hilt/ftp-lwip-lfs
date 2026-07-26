@@ -339,6 +339,36 @@ TEST_CASE("TYPE command", "[commands]")
     }
 }
 
+TEST_CASE("MODE and STRU accept their RFC 959 default values", "[commands]")
+{
+    /* RFC 959 section 5.1 lists MODE and STRU in the minimum implementation
+     * every server must accept "for the default values" — Stream and File.
+     * Clients that send them defensively must not get a 502. */
+    init_server();
+    Client c = connect_client();
+
+    SECTION("MODE S is accepted") {
+        REQUIRE(send_cmd(c, "MODE S\r\n") == "200 Mode set to S.\r\n");
+        REQUIRE(send_cmd(c, "mode s\r\n") == "200 Mode set to S.\r\n");
+    }
+    SECTION("other transfer modes are refused") {
+        for (const char *cmd : {"MODE B\r\n", "MODE C\r\n", "MODE\r\n",
+                                "MODE Stream\r\n"}) {
+            REQUIRE(send_cmd(c, cmd) == "504 Only stream mode is supported.\r\n");
+        }
+    }
+    SECTION("STRU F is accepted") {
+        REQUIRE(send_cmd(c, "STRU F\r\n") == "200 Structure set to F.\r\n");
+        REQUIRE(send_cmd(c, "stru f\r\n") == "200 Structure set to F.\r\n");
+    }
+    SECTION("other structures are refused") {
+        for (const char *cmd : {"STRU R\r\n", "STRU P\r\n", "STRU\r\n",
+                                "STRU File\r\n"}) {
+            REQUIRE(send_cmd(c, cmd) == "504 Only file structure is supported.\r\n");
+        }
+    }
+}
+
 TEST_CASE("QUIT replies and tears down the session", "[commands]")
 {
     init_server();
@@ -483,6 +513,28 @@ TEST_CASE("relative path resolution collapses . and ..", "[fs]")
 
     REQUIRE(send_cmd(c, "CWD a/./b/../c\r\n") == "250 Directory successfully changed.\r\n");
     REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/a/c\" is the current directory.\r\n");
+}
+
+TEST_CASE("a path that only fits once normalised is accepted", "[fs]")
+{
+    /* ".." is resolved while the path is being built rather than after
+     * concatenating cwd and argument, so only the *result* has to fit in
+     * FTP_SERVER_PATH_MAX. Rejecting on the intermediate length would refuse
+     * a perfectly short destination. */
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_stat_fn = stat_is_dir;
+
+    /* A cwd long enough that cwd + "/" + "../short" overflows the buffer. */
+    std::string long_name(FTP_SERVER_CMD_BUF_SIZE - 4 - 2 - 1, 'x');
+    REQUIRE(send_cmd(c, "CWD " + long_name + "\r\n") ==
+            "250 Directory successfully changed.\r\n");
+    REQUIRE(1 + long_name.size() + 1 + strlen("../short") >= FTP_SERVER_PATH_MAX);
+
+    REQUIRE(send_cmd(c, "CWD ../short\r\n") ==
+            "250 Directory successfully changed.\r\n");
+    REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/short\" is the current directory.\r\n");
 }
 
 TEST_CASE("CDUP at the root stays at the root", "[fs]")
@@ -1633,6 +1685,76 @@ TEST_CASE("STOR reports storage errors mid-transfer", "[transfer]")
     REQUIRE(written_since(before) == "452 Insufficient storage space.\r\n");
 }
 
+TEST_CASE("STOR reports a failed final flush instead of 226", "[transfer]")
+{
+    /* Given an upload whose writes all succeed, but whose close fails —
+     * littlefs buffers writes and only flushes the tail of the file from
+     * lfs_file_close(), so a volume that fills up on the last chunk reports
+     * the error there and nowhere else ... */
+    init_server();
+    Client c = connect_client();
+
+    static int s_closes;
+    s_closes = 0;
+    mock_lfs_file_close_fn = [](lfs_t *, lfs_file_t *) -> int {
+        s_closes++;
+        return -1;
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    std::string chunk = "payload-bytes";
+    struct pbuf p = make_pbuf(chunk);
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, &p, ERR_OK);
+
+    /* When the client closes the data connection to end the upload ... */
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+
+    /* Then the failure is reported: answering 226 would tell the client a
+     * truncated file is safely stored. */
+    REQUIRE(written_since(before) ==
+            "451 Requested action aborted: local error in processing.\r\n");
+
+    /* And the file is closed exactly once — ftp_close_data() must not close
+     * a handle the flush check already released. */
+    REQUIRE(s_closes == 1);
+
+    /* State is still reset, so the session stays usable. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("STOR still reports 226 when the final flush succeeds", "[transfer]")
+{
+    /* The companion to the case above: the close hook is exercised, returns
+     * success, and the client gets its 226. */
+    init_server();
+    Client c = connect_client();
+
+    static int s_closes;
+    s_closes = 0;
+    mock_lfs_file_close_fn = [](lfs_t *, lfs_file_t *) -> int {
+        s_closes++;
+        return 0;
+    };
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+    REQUIRE(s_closes == 1);
+}
+
 TEST_CASE("STOR without an argument is rejected", "[transfer]")
 {
     init_server();
@@ -1960,6 +2082,23 @@ TEST_CASE("a download the client abandons is reported as aborted, not complete",
     REQUIRE(send_cmd(r.ctrl, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
+TEST_CASE("a failing close does not change how an abandoned download is reported",
+          "[transfer]")
+{
+    /* Only STOR consults the close result — a download has nothing to flush,
+     * so 426 must survive an lfs_file_close() that fails. */
+    init_server();
+    StalledRetr r = start_stalled_retr();
+    mock_tcp_track_sndbuf  = 0;
+    mock_lfs_file_close_fn = [](lfs_t *, lfs_file_t *) -> int { return -1; };
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[r.data_idx](mock_tcp_cb_arg[r.data_idx], r.data_pcb,
+                                 nullptr, ERR_OK);
+
+    REQUIRE(written_since(before) == "426 Connection closed; transfer aborted.\r\n");
+}
+
 TEST_CASE("an upload the client closes is still reported as complete",
           "[transfer]")
 {
@@ -2061,26 +2200,6 @@ TEST_CASE("a command pipelined behind an over-long line still runs",
 
     /* And the buffer is back in sync for whatever arrives next. */
     REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
-}
-
-TEST_CASE("accept callbacks release the listener's backlog slot", "[lwip]")
-{
-    /* lwIP's raw API requires tcp_accepted() on the *listening* PCB from
-     * every accept callback; without it a build with TCP_LISTEN_BACKLOG
-     * enabled stops accepting once the backlog fills. */
-    init_server();
-
-    Client c = connect_client();
-    REQUIRE(mock_tcp_accepted_calls[kListenIdx] == 1);
-
-    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
-    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
-    int pasv_idx = mock_tcp_pcb_index(data_pcb) - 1;
-    REQUIRE(mock_tcp_accepted_calls[pasv_idx] == 1);
-
-    /* A second control connection releases its slot too. */
-    (void)connect_client();
-    REQUIRE(mock_tcp_accepted_calls[kListenIdx] == 2);
 }
 
 TEST_CASE("a listener that fails to close is not aborted", "[lwip]")

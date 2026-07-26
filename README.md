@@ -12,7 +12,7 @@ A minimal FTP server for embedded systems, built on the [lwIP](https://savannah.
 - Supports both passive (PASV) and active (PORT) data connections.
 - Optional username/password authentication.
 - Configurable number of concurrent client sessions.
-- Commands supported: `USER`, `PASS`, `SYST`, `FEAT`, `OPTS`, `TYPE`, `PWD`/`XPWD`, `CWD`/`XCWD`, `CDUP`/`XCUP`, `PASV`, `PORT`, `LIST`, `NLST`, `RETR`, `STOR`, `DELE`, `MKD`/`XMKD`, `RMD`/`XRMD`, `RNFR`, `RNTO`, `SIZE`, `NOOP`, `QUIT`, `ABOR`.
+- Commands supported: `USER`, `PASS`, `SYST`, `FEAT`, `OPTS`, `TYPE`, `MODE`, `STRU`, `PWD`/`XPWD`, `CWD`/`XCWD`, `CDUP`/`XCUP`, `PASV`, `PORT`, `LIST`, `NLST`, `RETR`, `STOR`, `DELE`, `MKD`/`XMKD`, `RMD`/`XRMD`, `RNFR`, `RNTO`, `SIZE`, `NOOP`, `QUIT`, `ABOR`.
 
 ## Files
 
@@ -108,10 +108,11 @@ If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credential
 - Only one data connection is active per session at a time. A transfer command issued while another is still pending is answered `450 Transfer already in progress`; `PASV` and `ABOR` both reset the state.
 - Each session's LFS file cache buffer (`FTP_SERVER_FILE_CACHE_SIZE`) must be >= `lfs_config.cache_size`; `ftp_server_init()` returns `ERR_ARG` otherwise.
 - Designed for constrained targets: no dynamic allocation beyond the static `s_sessions[FTP_SERVER_MAX_CLIENTS]` table.
-- Only binary transfers are implemented, so a session defaults to `TYPE I` and `TYPE A` is rejected with `504`.
+- Only binary transfers are implemented, so a session defaults to `TYPE I` and `TYPE A` is rejected with `504`. `MODE` and `STRU` are accepted for their RFC 959 §5.1 default values (`S` and `F`) and refused with `504` otherwise.
 - `PORT` only accepts the control connection's own peer address; pointing it at a third-party host is refused with `501` ([RFC 2577](https://www.rfc-editor.org/rfc/rfc2577) FTP-bounce mitigation).
 - `DELE` refuses directories and `RMD` refuses regular files, even though littlefs removes both with `lfs_remove()`.
-- A filesystem error part-way through a transfer ends it with `451`; a data-connection reset, an unusable data socket, or a download the client closes early all end it with `426` — never a misleading `226`. A client closing the data connection only means "transfer complete" for an upload (`STOR`).
+- A filesystem error part-way through a transfer ends it with `451`; a data-connection reset, an unusable data socket, or a download the client closes early all end it with `426` — never a misleading `226`. A client closing the data connection only means "transfer complete" for an upload (`STOR`), and only if the final `lfs_file_close()` flush succeeds — littlefs writes the tail of a file there, so a volume that fills up on the last chunk is reported as `451` rather than `226`.
+- Path resolution normalises `.`/`..` straight into the result buffer, so `FTP_SERVER_PATH_MAX` bounds the *resolved* path: `CWD ../short` works from a directory too deep for `cwd + "/../short"` to fit. A single component that cannot itself be buffered is still rejected with `550`.
 
 ## Continuous Integration
 
