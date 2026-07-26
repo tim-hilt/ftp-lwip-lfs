@@ -48,8 +48,17 @@ function(ftp_add_server_library name)
     if(ARGN)
         target_compile_definitions(${name} PUBLIC ${ARGN})
     endif()
+    # -Wall/-Wextra first: without them -Werror guards almost nothing, since
+    # the compiler's default warning set is nearly empty. The conversion and
+    # shadow warnings are the ones that catch real defects in code this full of
+    # uint16_t buffer arithmetic; ftp_server.c is clean under all of them.
     target_compile_options(${name} PRIVATE
         -Werror
+        -Wall
+        -Wextra
+        -Wshadow
+        -Wconversion
+        -Wsign-conversion
         -Wunused-function
         -Wunused-variable
         -Wunused-parameter

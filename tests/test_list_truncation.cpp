@@ -2,8 +2,8 @@
  * @file test_list_truncation.cpp
  * @brief LIST behaviour when an entry does not fit the transfer buffer.
  *
- * A LIST line is 47 bytes of fixed columns plus the file name, so it overruns
- * FTP_SERVER_DATA_BUF_SIZE once a name approaches the buffer size. That is
+ * A LIST line is 45 bytes of fixed columns plus the file name and a CRLF, so it
+ * overruns FTP_SERVER_DATA_BUF_SIZE once a name approaches the buffer. That is
  * unreachable in the default build (512-byte buffer against a 255-byte
  * LFS_NAME_MAX), so CMake compiles this file against a copy of the library
  * configured with FTP_SERVER_DATA_BUF_SIZE=64.
@@ -49,10 +49,10 @@ std::string list_output(const Client &c)
 TEST_CASE("a LIST entry too long for the transfer buffer still ends in CRLF",
           "[list]")
 {
-    /* snprintf() truncates the tail of the line, and the CRLF is the very
-     * last thing on it — so a plain clamp emits a shortened name with no
-     * terminator and the client parses this entry and the next one as a
-     * single mangled line. The clamp has to put the CRLF back. */
+    /* The CRLF is the very last thing on the line, so a formatter that simply
+     * ran out of buffer would emit a shortened name with no terminator and the
+     * client would parse this entry and the next one as a single mangled line.
+     * The two bytes are reserved up front instead. */
     init_server();
     Client c = connect_client();
     mock_lfs_dir_read_fn = dir_read_one_long_name;
@@ -69,8 +69,10 @@ TEST_CASE("a LIST entry too long for the transfer buffer still ends in CRLF",
     REQUIRE(end > start);
     std::string entry = out.substr(start, end - start);
 
-    /* Truncated to the buffer, terminated, and still recognisable. */
-    REQUIRE(entry.size() == FTP_SERVER_DATA_BUF_SIZE - 1);
+    /* Truncated to the buffer, terminated, and still recognisable. The entry is
+     * handed on as a length rather than a C string, so the whole buffer is
+     * usable and no byte is reserved for a NUL. */
+    REQUIRE(entry.size() == FTP_SERVER_DATA_BUF_SIZE);
     REQUIRE(entry.compare(entry.size() - 2, 2, "\r\n") == 0);
     REQUIRE(entry.rfind("-rw-r--r--", 0) == 0);
     /* Exactly one line: nothing after the terminator, and no stray CR/LF

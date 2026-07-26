@@ -26,10 +26,24 @@
 
 #include "lfs.h"
 
+/* Deliberately no <stdio.h>/<stdlib.h>: snprintf() and strtoul() were the only
+ * users, and on a typical newlib target snprintf drags several KB of vfprintf
+ * into an image whose whole point is to be small. The handful of replies and
+ * the two listing formats that need formatting go through ftp_put_str()/
+ * ftp_put_uint() instead, and ftp_parse_port_arg() reads its own digits. */
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <ctype.h>
+
+/* The listing formatter reserves the last two bytes of the transfer buffer for
+ * the CRLF that terminates an entry, and a reply buffer has to hold at least
+ * the fixed text of the longest reply. Both are configurable, so state the
+ * floor rather than let a small value corrupt the arithmetic. */
+#if FTP_SERVER_DATA_BUF_SIZE < 64
+#error "FTP_SERVER_DATA_BUF_SIZE must be at least 64"
+#endif
+#if FTP_SERVER_PATH_MAX < 16
+#error "FTP_SERVER_PATH_MAX must be at least 16"
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Internal types                                                    */
@@ -194,8 +208,53 @@ static void   ftp_send_next_data(ftp_session_t *s);
 /** Bounded copy that always NUL-terminates. @p size must be non-zero. */
 static void ftp_strlcpy(char *dst, const char *src, size_t size)
 {
-    strncpy(dst, src, size - 1);
-    dst[size - 1] = '\0';
+    /* Not strncpy(): that NUL-pads the whole destination, so every CWD would
+     * scribble over all of FTP_SERVER_PATH_MAX to store a short path. */
+    size_t n = 0;
+    while (n + 1 < size && src[n] != '\0') {
+        dst[n] = src[n];
+        n++;
+    }
+    dst[n] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helper: bounded text building                                     */
+/*                                                                    */
+/*  Both take the write cursor and a one-past-the-last-writable-byte   */
+/*  limit, clamp to it, and return the new cursor, so a sequence of    */
+/*  appends can be written without a bounds check between each one.    */
+/*  Nothing is NUL-terminated: the callers either terminate once at    */
+/*  the end (replies) or use the returned length (listing entries).    */
+/* ------------------------------------------------------------------ */
+
+static char *ftp_put_str(char *dst, const char *const end, const char *src)
+{
+    while (*src != '\0' && dst < end) *dst++ = *src++;
+    return dst;
+}
+
+/**
+ * Append @p val in decimal, right-aligned in at least @p width columns by
+ * padding with leading spaces (@p width 0 for no padding) — the LIST size
+ * column is the only caller that needs it.
+ */
+static char *ftp_put_uint(char *dst, const char *const end, unsigned long val,
+                          unsigned width)
+{
+    char     digits[20];   /* 2^64 is 20 decimal digits */
+    unsigned n = 0;
+    do {
+        digits[n++] = (char)('0' + (val % 10));
+        val /= 10;
+    } while (val != 0);
+
+    while (width > n && dst < end) {
+        *dst++ = ' ';
+        width--;
+    }
+    while (n > 0 && dst < end) *dst++ = digits[--n];
+    return dst;
 }
 
 /** Case-insensitive strcmp — strcasecmp is POSIX, not C99. */
@@ -278,10 +337,9 @@ static struct tcp_pcb *ftp_listen_on(uint16_t port, err_t *err)
 /**
  * Fetch the remote address of @p pcb.
  *
- * Hands back the whole ip_addr_t rather than an IPv4 u32 on purpose: the
- * callers compare it with ip_addr_cmp(), and ip_addr_get_ip4_u32() yields 0
- * for *every* IPv6 address in a dual-stack build (lwip/ip_addr.h), which would
- * make any two IPv6 peers compare equal and defeat the RFC 2577 checks below.
+ * Hands back the whole ip_addr_t rather than an IPv4 u32 so the callers can
+ * compare with ip_addr_cmp(); flattening first would defeat the RFC 2577
+ * checks entirely (DESIGN.md, "Security").
  *
  * @return 0 on success, -1 if the peer cannot be determined.
  */
@@ -466,22 +524,27 @@ static void ftp_send_reply(ftp_session_t *s, const char *msg)
  * quoted form would not fit in s_reply is truncated rather than given a second
  * FTP_SERVER_PATH_MAX of static RAM — that needs a path near the length limit
  * made mostly of quote characters.
+ *
+ * A doubled quote is emitted all-or-nothing. Truncating between the two halves
+ * would leave the escape unbalanced, and the client would then read the closing
+ * quote as the second half of an escaped one and never find the end of the
+ * name — a mangled reply rather than a merely shortened one.
  */
 static void ftp_send_257(ftp_session_t *s, const char *path, const char *tail)
 {
-    size_t tail_len = strlen(tail);
-    char       *dst = s_reply;
+    char       *dst = ftp_put_str(s_reply, s_reply + sizeof(s_reply), "257 \"");
     /* Reserve room for the closing quote, the tail and the terminator. */
-    const char *end = s_reply + sizeof(s_reply) - tail_len - 2;
+    char *const end = s_reply + sizeof(s_reply) - strlen(tail) - 2;
 
-    memcpy(dst, "257 \"", 5);
-    dst += 5;
-    for (; *path && dst < end; path++) {
+    for (; *path != '\0'; path++) {
+        int need = (*path == '"') ? 2 : 1;
+        if (end - dst < need) break;
         *dst++ = *path;
-        if (*path == '"' && dst < end) *dst++ = '"';
+        if (*path == '"') *dst++ = '"';
     }
     *dst++ = '"';
-    memcpy(dst, tail, tail_len + 1);
+    dst = ftp_put_str(dst, s_reply + sizeof(s_reply) - 1, tail);
+    *dst = '\0';
 
     ftp_send_reply(s, s_reply);
 }
@@ -633,33 +696,31 @@ static int ftp_fill_next_chunk(ftp_session_t *s)
             continue;
         }
 
-        int n;
-        if (s->data_mode == FTP_DATA_NLST) {
-            n = snprintf((char *)s->data_buf, FTP_SERVER_DATA_BUF_SIZE,
-                         "%s\r\n", info.name);
-        } else {
-            /* LIST: emit a Unix-style listing */
-            const char *type_str = (info.type == LFS_TYPE_DIR)
-                ? "drwxr-xr-x" : "-rw-r--r--";
-            n = snprintf((char *)s->data_buf, FTP_SERVER_DATA_BUF_SIZE,
-                         "%s 1 ftp ftp %10lu Jan 01  2000 %s\r\n",
-                         type_str,
-                         (unsigned long)info.size,
-                         info.name);
+        /* The entry is returned as a length, never as a C string, so the whole
+         * buffer is available and no slot goes to a NUL terminator. */
+        char *const buf = (char *)s->data_buf;
+        char *const end = buf + FTP_SERVER_DATA_BUF_SIZE - 2; /* CRLF reserved */
+        char       *dst = buf;
+
+        if (s->data_mode == FTP_DATA_LIST) {
+            /* A Unix-style listing: 45 bytes of fixed columns, the name, and
+             * the CRLF. littlefs stores no timestamp, so the date is a
+             * constant that clients parse and ignore. */
+            dst = ftp_put_str(dst, end, (info.type == LFS_TYPE_DIR)
+                                            ? "drwxr-xr-x" : "-rw-r--r--");
+            dst = ftp_put_str(dst, end, " 1 ftp ftp ");
+            dst = ftp_put_uint(dst, end, (unsigned long)info.size, 10);
+            dst = ftp_put_str(dst, end, " Jan 01  2000 ");
         }
-        if (n < 0) return FTP_CHUNK_ERR;
-        /* snprintf returns the length it *would* have written; on truncation
-         * only FTP_SERVER_DATA_BUF_SIZE - 1 bytes are real, the last slot
-         * holding the NUL terminator. Put the CRLF back after clamping: it is
-         * the first thing truncation drops, and without it the shortened name
-         * runs into the following entry and the client parses one mangled
-         * line instead of two. */
-        if (n >= (int)FTP_SERVER_DATA_BUF_SIZE) {
-            n = (int)FTP_SERVER_DATA_BUF_SIZE - 1;
-            s->data_buf[n - 2] = '\r';
-            s->data_buf[n - 1] = '\n';
-        }
-        return n;
+        dst = ftp_put_str(dst, end, info.name);
+
+        /* The CRLF is what truncation drops first, and without it a clamped
+         * name runs into the following entry and the client parses one mangled
+         * line instead of two. Reserving the two bytes up front means it is
+         * always there, so there is no clamped-length case to repair. */
+        *dst++ = '\r';
+        *dst++ = '\n';
+        return (int)(dst - buf);
     }
 }
 
@@ -670,7 +731,12 @@ static int ftp_fill_next_chunk(ftp_session_t *s)
  */
 static void ftp_send_next_data(ftp_session_t *s)
 {
-    if (!s->data_pcb) return;
+    /* data_connecting means the PCB exists but its handshake is outstanding, so
+     * it is not a usable data connection yet. lwIP polls a SYN_SENT PCB and
+     * tcp_write() accepts one, so without this guard ftp_data_poll() would run
+     * the whole transfer into a connection that never opened. See DESIGN.md,
+     * "Data transfers". */
+    if (!s->data_pcb || s->data_connecting) return;
 
     for (;;) {
         /* Flush what is already buffered — leftovers from a previous fill on
@@ -746,10 +812,14 @@ static void ftp_start_transfer(ftp_session_t *s)
         ftp_send_reply(s, "150 Ok to send data.\r\n");
     } else if (s->data_mode == FTP_DATA_RETR) {
         /* Only binary transfers are implemented (TYPE rejects anything else),
-         * so the mode is a constant. Clients that care parse the byte count. */
-        (void)snprintf(s_reply, sizeof(s_reply),
-                 "150 Opening BINARY mode data connection (%ld bytes).\r\n",
-                 (long)s->retr_size);
+         * so the mode is a constant. Clients that care parse the byte count.
+         * cmd_retr() has already rejected a negative size. */
+        char *const end = s_reply + sizeof(s_reply) - 1;
+        char       *dst = ftp_put_str(s_reply, end,
+                    "150 Opening BINARY mode data connection (");
+        dst = ftp_put_uint(dst, end, (unsigned long)s->retr_size, 0);
+        dst = ftp_put_str(dst, end, " bytes).\r\n");
+        *dst = '\0';
         ftp_send_reply(s, s_reply);
         ftp_send_next_data(s);
     } else {
@@ -794,13 +864,10 @@ static void ftp_begin_transfer(ftp_session_t *s)
                 /* ftp_data_connected() will call ftp_start_transfer(). */
                 return;
             }
-            /* tcp_connect() leaves the PCB in the CLOSED state on every
-             * failure path (tcp.c), where tcp_close() just unlinks and frees
-             * it. Letting ftp_close_data() do that is what keeps the reply
-             * single: it detaches ftp_data_err() first, whereas a bare
-             * tcp_abort() here would re-enter it through TCP_EVENT_ERR —
-             * which the raw-callback build fires unconditionally — and emit a
-             * spurious 426 ahead of the 425 below. */
+            /* Fall through to ftp_close_data(), which detaches ftp_data_err()
+             * before closing. A bare tcp_abort() here would re-enter it and
+             * emit a spurious 426 ahead of the 425 below; see DESIGN.md,
+             * "Data transfers". */
         }
         ftp_close_data(s);
         ftp_send_reply(s, ftp_reply_no_data);
@@ -833,12 +900,11 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_ABRT;
     }
 
-    /* RFC 2577: the data connection must come from the same host as the
-     * control connection — the passive counterpart of the anti-bounce check
-     * in cmd_port(). The listener binds IP_ADDR_ANY, so without this anyone
-     * who can reach the passive port may race the real client onto it and
-     * take delivery of a RETR (or supply the contents of a STOR). Leave the
-     * listener open so the genuine client can still connect. */
+    /* RFC 2577: the data connection must come from the same host as the control
+     * connection — the passive counterpart of the anti-bounce check in
+     * cmd_port(), since the listener binds IP_ADDR_ANY (DESIGN.md,
+     * "Security"). The listener stays open so the genuine client can still
+     * connect. */
     ip_addr_t ctrl_addr;
     ip_addr_t data_addr;
     if (ftp_peer_addr(s->ctrl_pcb, &ctrl_addr) < 0 ||
@@ -879,21 +945,12 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return ERR_OK;
     }
 
-    /* Data arriving before the command that consumes it has been processed —
-     * a client that connects to the passive port and starts sending without
-     * waiting for the "150". There is nowhere to put it yet, and discarding
-     * it would silently lose the head of the upload.
-     *
+    /* Data arriving before the command that consumes it has been processed.
      * Returning a non-OK error *without* consuming the pbuf hands it back to
      * lwIP, which parks it in pcb->refused_data (tcp_in.c) and re-offers it
-     * from tcp_fasttmr every 250 ms (tcp.c) until it is taken — so the STOR
-     * that follows still receives its first chunk, with no buffer of our own.
-     * A FIN that arrives meanwhile is held back with it, so an upload that
-     * ends here is still reported once the data has actually been written.
-     *
-     * Deliberately not counted as activity below: a client that connects,
-     * sends junk and never issues a command has to hit the idle timeout
-     * rather than keep the session alive by being re-offered forever. */
+     * from tcp_fasttmr every 250 ms (tcp.c) until it is taken. Deliberately
+     * ahead of the idle_polls reset below, so being re-offered forever cannot
+     * keep a session alive. See DESIGN.md, "Data transfers". */
     if (p && s->data_mode == FTP_DATA_IDLE) return ERR_MEM;
 
     s->data_aborted = 0;
@@ -951,19 +1008,30 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     return ERR_OK;
 }
 
-static err_t ftp_data_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
+/**
+ * Shared body of the two data-channel callbacks that resume a send.
+ *
+ * @param progress Whether reaching here proves the transfer moved. Only the
+ *                 tcp_sent path does; see ftp_data_poll().
+ */
+static err_t ftp_data_pump(void *arg, int progress)
 {
     ftp_session_t *s = (ftp_session_t *)arg;
-    (void)pcb;
-    (void)len;
     if (!s) return ERR_OK;
     s->data_aborted = 0;
-    s->idle_polls   = 0; /* transfer is making progress */
+    if (progress) s->idle_polls = 0;
 
-    /* Previous chunk ACK'd — send more data. */
     if (ftp_mode_is_send(s->data_mode)) ftp_send_next_data(s);
 
     return s->data_aborted ? ERR_ABRT : ERR_OK;
+}
+
+/** Previous chunk ACK'd — send more data. */
+static err_t ftp_data_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+    (void)pcb;
+    (void)len;
+    return ftp_data_pump(arg, 1);
 }
 
 /**
@@ -976,19 +1044,15 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
  * and no tcp_sent will ever fire, so without this the transfer would sit
  * untouched until the idle timer killed the whole session.
  *
- * Deliberately does not reset idle_polls: a transfer that only ever gets here
- * is making no progress and should still time out.
+ * Deliberately does not count as progress: a transfer that only ever gets here
+ * is making none and should still time out. Note that lwIP also polls a PCB
+ * whose connect is still outstanding; ftp_send_next_data() is what refuses to
+ * serve that.
  */
 static err_t ftp_data_poll(void *arg, struct tcp_pcb *pcb)
 {
-    ftp_session_t *s = (ftp_session_t *)arg;
     (void)pcb;
-    if (!s) return ERR_OK;
-    s->data_aborted = 0;
-
-    if (ftp_mode_is_send(s->data_mode)) ftp_send_next_data(s);
-
-    return s->data_aborted ? ERR_ABRT : ERR_OK;
+    return ftp_data_pump(arg, 0);
 }
 
 static void ftp_data_err(void *arg, err_t err)
@@ -1188,12 +1252,10 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     if (tcp_tcp_get_tcp_addrinfo(s->ctrl_pcb, 1, &local_ip, &local_port) != ERR_OK ||
         !IP_IS_V4(&local_ip)) {
         /* local_ip is untouched on failure — advertising it would send the
-         * client at a garbage address. The 227 reply can only carry four
-         * IPv4 octets, and ip_addr_get_ip4_u32() flattens anything else to
-         * 0.0.0.0, so a control connection that is not IPv4 has to be refused
-         * rather than answered with a bogus address. (RFC 2428 EPSV is the
-         * extension that covers IPv6; it is not implemented.) IP_IS_V4 is a
-         * constant 1 in an IPv4-only lwIP, so this costs nothing there. */
+         * client at a garbage address. A 227 carries four IPv4 octets and
+         * nothing else, so a control connection that is not IPv4 has to be
+         * refused rather than answered with a bogus address; see DESIGN.md,
+         * "Security". IP_IS_V4 is a constant 1 in an IPv4-only lwIP. */
         ftp_close_data(s);
         ftp_send_reply(s, "421 Cannot determine server address.\r\n");
         return;
@@ -1202,41 +1264,59 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
     uint32_t ip4 = ip_addr_get_ip4_u32(&local_ip);
     uint8_t *ip  = (uint8_t *)&ip4;
 
-    (void)snprintf(s_reply, sizeof(s_reply),
-             "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u).\r\n",
-             ip[0], ip[1], ip[2], ip[3],
-             (unsigned)(port >> 8), (unsigned)(port & 0xff));
+    char *const end = s_reply + sizeof(s_reply) - 1;
+    char       *dst = ftp_put_str(s_reply, end, "227 Entering Passive Mode (");
+    for (int i = 0; i < 4; i++) {
+        dst = ftp_put_uint(dst, end, ip[i], 0);
+        dst = ftp_put_str(dst, end, ",");
+    }
+    dst = ftp_put_uint(dst, end, (unsigned long)(port >> 8), 0);
+    dst = ftp_put_str(dst, end, ",");
+    dst = ftp_put_uint(dst, end, (unsigned long)(port & 0xff), 0);
+    dst = ftp_put_str(dst, end, ").\r\n");
+    *dst = '\0';
     ftp_send_reply(s, s_reply);
 }
 
 /**
  * Parse a PORT argument, "h1,h2,h3,h4,p1,p2", into six 0..255 fields.
+ *
+ * Hand-rolled rather than strtoul(): that pulls in <stdlib.h> for one call, and
+ * it also accepts leading whitespace and a sign, neither of which the RFC 959
+ * HOST-PORT syntax permits. Only decimal digits are taken here.
+ *
  * @return 0 on success, -1 on any syntax error.
  */
-static int ftp_parse_port_arg(const char *arg, unsigned long fields[6])
+static int ftp_parse_port_arg(const char *arg, uint8_t fields[6])
 {
     const char *p = arg;
     for (int i = 0; i < 6; i++) {
-        char *end = NULL;
-        fields[i] = strtoul(p, &end, 10);
-        if (end == p || fields[i] > 255) return -1;
-        if (*end != ((i < 5) ? ',' : '\0')) return -1;
-        p = end + 1;
+        unsigned val    = 0;
+        int      digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            val = (val * 10u) + (unsigned)(*p++ - '0');
+            /* Bail on the fourth digit rather than let a long run of them
+             * wrap around into a value that passes the 255 test. */
+            if (++digits > 3 || val > 255) return -1;
+        }
+        if (digits == 0) return -1;
+        if (*p != ((i < 5) ? ',' : '\0')) return -1;
+        if (i < 5) p++;
+        fields[i] = (uint8_t)val;
     }
     return 0;
 }
 
 static void cmd_port(ftp_session_t *s, const char *arg)
 {
-    unsigned long fields[6];
+    uint8_t fields[6];
     if (!arg || ftp_parse_port_arg(arg, fields) < 0) {
         ftp_send_reply(s, "501 Syntax error in parameters.\r\n");
         return;
     }
 
     ip_addr_t addr;
-    IP_ADDR4(&addr, (unsigned int)fields[0], (unsigned int)fields[1],
-                    (unsigned int)fields[2], (unsigned int)fields[3]);
+    IP_ADDR4(&addr, fields[0], fields[1], fields[2], fields[3]);
 
     /* RFC 2577: refuse to open a data connection to anywhere other than the
      * client itself, so the server cannot be used as an "FTP bounce" proxy.
@@ -1256,7 +1336,7 @@ static void cmd_port(ftp_session_t *s, const char *arg)
     if (!s->ctrl_pcb) return;
 
     s->port_addr   = addr;
-    s->port_port   = (uint16_t)((fields[4] << 8) | fields[5]);
+    s->port_port   = (uint16_t)(((unsigned)fields[4] << 8) | fields[5]);
     s->port_active = 1;
 
     ftp_send_reply(s, "200 PORT command successful.\r\n");
@@ -1438,8 +1518,11 @@ static void cmd_size(ftp_session_t *s, const char *arg)
         ftp_send_reply(s, "550 Could not get file size.\r\n");
         return;
     }
-    (void)snprintf(s_reply, sizeof(s_reply), "213 %lu\r\n",
-             (unsigned long)info.size);
+    char *const end = s_reply + sizeof(s_reply) - 1;
+    char       *dst = ftp_put_str(s_reply, end, "213 ");
+    dst = ftp_put_uint(dst, end, (unsigned long)info.size, 0);
+    dst = ftp_put_str(dst, end, "\r\n");
+    *dst = '\0';
     ftp_send_reply(s, s_reply);
 }
 
@@ -1850,7 +1933,9 @@ static err_t ftp_ctrl_accept(void *arg, struct tcp_pcb *pcb, err_t err)
 
 err_t ftp_server_init(lfs_t *lfs)
 {
-    if (!lfs) return ERR_ARG;
+    /* cfg is checked too: it is dereferenced right below, and a caller that
+     * can hand over an unmounted lfs_t can hand over one with no config. */
+    if (!lfs || !lfs->cfg) return ERR_ARG;
     if (lfs->cfg->cache_size > FTP_SERVER_FILE_CACHE_SIZE) return ERR_ARG;
 
     /* Make re-initialisation safe: drop any listener/sessions still around. */

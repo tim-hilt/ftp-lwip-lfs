@@ -59,9 +59,9 @@ Override any of these macros before including `ftp_server.h` (e.g. via a `-D` co
 | `FTP_SERVER_MAX_CLIENTS`          | `2`     | Maximum concurrent sessions.                      |
 | `FTP_SERVER_USER`                 | `NULL`  | Required username, or `NULL` to skip auth.        |
 | `FTP_SERVER_PASS`                 | `NULL`  | Required password, or `NULL` to skip auth.        |
-| `FTP_SERVER_DATA_BUF_SIZE`        | `512`   | Per-session transfer buffer size (bytes).         |
+| `FTP_SERVER_DATA_BUF_SIZE`        | `512`   | Per-session transfer buffer size (bytes); minimum 64. A LIST line is 47 bytes plus the name, so anything at or below `47 + LFS_NAME_MAX` truncates listings of the longest names. |
 | `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes).     |
-| `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length.                     |
+| `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length; minimum 16.         |
 | `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must be >= `lfs_config.cache_size` (checked at `ftp_server_init()`). |
 | `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected (see [DESIGN.md](DESIGN.md#resource-model)). |
 
@@ -114,8 +114,8 @@ Behavioural details — transfer semantics, resource limits, the RFC 2577 data-c
 
 | Job           | What it checks                                                          |
 |---------------|--------------------------------------------------------------------------|
-| `build`       | `ftp_server.c`/`.h` compile cleanly (`-Werror` + unused-code warnings). |
-| `unit-tests`  | All three Catch2 suites build and pass (see [Testing](#testing)).      |
+| `build`       | `ftp_server.c`/`.h` compile cleanly (`-Werror -Wall -Wextra -Wshadow -Wconversion -Wsign-conversion` + unused-code warnings). |
+| `unit-tests`  | All five Catch2 suites build and pass (see [Testing](#testing)).       |
 | `clang-tidy`  | Static analysis is clean (see below).                                  |
 | `coverage`    | Computes line coverage of `ftp_server.c` (via `gcovr`) after `build`/`unit-tests` pass; on `main` pushes it commits the badge data to `.github/badges/coverage.json`. |
 
@@ -131,15 +131,17 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`FTP_SERVER_USER` / `FTP_SERVER_PASS` are compile-time constants, so the login paths cannot be reached from a single build. CMake therefore produces three executables, each linked against its own copy of the library:
+Several configuration macros are compile-time constants, so the paths they guard cannot all be reached from a single build. CMake therefore produces five executables, each linked against its own copy of the library:
 
-| Executable            | Library configuration              | Covers                                  |
-|-----------------------|------------------------------------|-----------------------------------------|
-| `ftp_tests`           | no credentials (the default)       | `tests/test_main.cpp` — the protocol     |
-| `ftp_tests_auth`      | `FTP_SERVER_USER` + `FTP_SERVER_PASS` | `tests/test_auth.cpp` — USER/PASS flow |
-| `ftp_tests_user_only` | `FTP_SERVER_USER` only             | `tests/test_auth.cpp` — USER logs in     |
+| Executable             | Library configuration                 | Covers                                     |
+|------------------------|---------------------------------------|--------------------------------------------|
+| `ftp_tests`            | no credentials (the default)          | `tests/test_main.cpp` — the protocol        |
+| `ftp_tests_auth`       | `FTP_SERVER_USER` + `FTP_SERVER_PASS` | `tests/test_auth.cpp` — USER/PASS flow      |
+| `ftp_tests_user_only`  | `FTP_SERVER_USER` only                | `tests/test_auth.cpp` — USER logs in        |
+| `ftp_tests_short_path` | `FTP_SERVER_PATH_MAX=64`              | `tests/test_path_limits.cpp` — path overflow, unreachable while `FTP_SERVER_PATH_MAX` equals `FTP_SERVER_CMD_BUF_SIZE` |
+| `ftp_tests_short_data` | `FTP_SERVER_DATA_BUF_SIZE=64`         | `tests/test_list_truncation.cpp` — a LIST line too long for the transfer buffer |
 
-The `coverage` job merges the `.gcda` files from all three, so the reported figure covers the credential paths too. `tests/ftp_test_support.hpp` holds the shared harness that drives ftp_server.c's registered lwIP callbacks.
+The `coverage` job merges the `.gcda` files from all five, so the reported figure covers the credential and overflow paths too. `tests/ftp_test_support.hpp` holds the shared harness that drives ftp_server.c's registered lwIP callbacks.
 
 ## Static Analysis
 

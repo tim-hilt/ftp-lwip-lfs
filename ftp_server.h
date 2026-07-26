@@ -14,12 +14,12 @@
  *   FTP_SERVER_MAX_CLIENTS    - Maximum concurrent sessions (default 2)
  *   FTP_SERVER_USER           - Required username, or NULL to skip auth
  *   FTP_SERVER_PASS           - Required password, or NULL to skip auth
- *   FTP_SERVER_DATA_BUF_SIZE  - Per-session transfer buffer (default 512).
- *                               One LIST entry is 47 + strlen(name) bytes, so
- *                               a buffer below 47 + LFS_NAME_MAX truncates
- *                               listing lines for the longest names.
+ *   FTP_SERVER_DATA_BUF_SIZE  - Per-session transfer buffer (default 512,
+ *                               minimum 64). One LIST entry is 47 + strlen(name)
+ *                               bytes, so anything at or below 47 + LFS_NAME_MAX
+ *                               truncates listing lines for the longest names.
  *   FTP_SERVER_CMD_BUF_SIZE   - Per-session command line buffer (default 256)
- *   FTP_SERVER_PATH_MAX       - Maximum path length (default 256)
+ *   FTP_SERVER_PATH_MAX       - Maximum path length (default 256, minimum 16)
  *   FTP_SERVER_FILE_CACHE_SIZE - LFS file cache per session (default 256,
  *                                must be >= lfs_config.cache_size)
  *   FTP_SERVER_IDLE_TIMEOUT_POLLS - Idle polls before disconnect (default 60)
@@ -65,6 +65,7 @@ extern "C" {
 #endif
 
 #ifndef FTP_SERVER_DATA_BUF_SIZE
+/** Minimum 64; ftp_server.c rejects less at compile time. */
 #define FTP_SERVER_DATA_BUF_SIZE 512
 #endif
 

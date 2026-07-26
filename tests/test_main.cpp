@@ -794,6 +794,53 @@ TEST_CASE("257 replies double an embedded quote", "[fs]")
         REQUIRE(reply.size() < FTP_SERVER_PATH_MAX + 64);
         REQUIRE(reply.substr(reply.size() - 12) == "\" created.\r\n");
     }
+
+    SECTION("truncation never splits a doubled quote") {
+        /* Given a name whose quoted form overflows the shared reply buffer, the
+         * pair that does not fit has to be dropped whole. Emitting only its
+         * first half leaves the escape unbalanced, and the client then reads the
+         * closing quote as the second half of an escaped one and never finds the
+         * end of the pathname. A merely shortened name is recoverable; a mangled
+         * one is not.
+         *
+         * Whether the cut-off lands *between* the halves depends on the parity
+         * of the reply's fixed text and of the name, so both 257 replies are
+         * checked at both alignments — a single case passes by luck. */
+        mock_lfs_stat_fn = stat_is_dir;
+        const size_t kQuotes = (FTP_SERVER_PATH_MAX + 64) / 2; /* > half s_reply */
+
+        /* Every quote between the opening one and @p tail is either half of a
+         * doubled pair or the single closing quote, so the count must be odd. */
+        auto quotes_before = [](const std::string &reply, const char *tail) {
+            size_t open_q = reply.find('"');
+            size_t at     = reply.find(tail);
+            REQUIRE(open_q != std::string::npos);
+            REQUIRE(at > open_q);
+            size_t n = 0;
+            for (size_t i = open_q + 1; i < at; i++) {
+                if (reply[i] == '"') n++;
+            }
+            return n;
+        };
+
+        for (const char *prefix : {"", "a"}) {
+            std::string name = std::string(prefix) + std::string(kQuotes, '"');
+
+            std::string mkd = send_cmd(c, "MKD " + name + "\r\n");
+            REQUIRE(mkd.rfind("257 \"/", 0) == 0);
+            REQUIRE(mkd.size() < FTP_SERVER_PATH_MAX + 64);
+            REQUIRE(mkd.substr(mkd.size() - 12) == "\" created.\r\n");
+            REQUIRE(quotes_before(mkd, " created.\r\n") % 2 == 1);
+
+            REQUIRE(send_cmd(c, "CWD /" + name + "\r\n") ==
+                    "250 Directory successfully changed.\r\n");
+            std::string pwd = send_cmd(c, "PWD\r\n");
+            REQUIRE(pwd.size() < FTP_SERVER_PATH_MAX + 64);
+            REQUIRE(quotes_before(pwd, " is the current directory.\r\n") % 2 == 1);
+            REQUIRE(send_cmd(c, "CWD /\r\n") ==
+                    "250 Directory successfully changed.\r\n");
+        }
+    }
 }
 
 TEST_CASE("RMD removes a directory or reports failure", "[fs]")
@@ -2061,6 +2108,61 @@ TEST_CASE("active-mode data connection failures are reported", "[transfer]")
 
     /* Every failure path must leave the session able to transfer again. */
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("a data poll during a pending connect does not run the transfer",
+          "[transfer]")
+{
+    /* Given an active-mode RETR whose tcp_connect() is still in the handshake —
+     * what an FTP client behind a firewall that drops the inbound SYN looks
+     * like, and lwIP retransmits the SYN for several seconds.
+     *
+     * lwIP's tcp_slowtmr polls every PCB on tcp_active_pcbs, and a SYN_SENT PCB
+     * is on that list; tcp_write() accepts SYN_SENT too. So the data poll fires
+     * on a connection that has not opened. */
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 5; };
+    g_retr_text = "abcde";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    static struct tcp_pcb *s_pcb;
+    static tcp_connected_fn s_cb;
+    s_pcb = nullptr;
+    s_cb  = nullptr;
+    mock_tcp_connect_fn = [](struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
+                             tcp_connected_fn connected) -> err_t {
+        s_pcb = pcb;   /* SYN sent; the handshake has not completed */
+        s_cb  = connected;
+        return ERR_OK;
+    };
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") == "200 PORT command successful.\r\n");
+    REQUIRE(send_cmd(c, "RETR file.bin\r\n").empty()); /* awaiting connect */
+    mock_tcp_connect_fn = nullptr;
+
+    int idx = mock_tcp_pcb_index(s_pcb);
+    REQUIRE(idx >= 0);
+    REQUIRE(mock_tcp_cb_poll[idx] != nullptr);
+
+    /* When the data poll fires while the connect is still outstanding. */
+    u16_t before = mock_tcp_write_len;
+    REQUIRE(mock_tcp_cb_poll[idx](mock_tcp_cb_arg[idx], s_pcb) == ERR_OK);
+
+    /* Then nothing is sent and nothing is announced. Serving the poll would
+     * push the file into a connection the client never accepted and answer
+     * "226 Transfer complete" for it — ahead of the "150" that is supposed to
+     * come first, and with the data going nowhere. */
+    REQUIRE(written_since(before).empty());
+
+    /* And the transfer still runs correctly once the handshake completes. */
+    before = mock_tcp_write_len;
+    REQUIRE(s_cb(mock_tcp_cb_arg[idx], s_pcb, ERR_OK) == ERR_OK);
+    std::string out = written_since(before);
+    REQUIRE(out.rfind("150 Opening BINARY mode data connection (5 bytes).\r\n", 0) == 0);
+    REQUIRE(out.find("abcde") != std::string::npos);
+    REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
 }
 
 /* ==================================================================== */
