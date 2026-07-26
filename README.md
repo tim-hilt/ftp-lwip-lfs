@@ -20,6 +20,7 @@ A minimal FTP server for embedded systems, built on the [lwIP](https://savannah.
 |-----------------|-----------------------------------------------|
 | `ftp_server.h`  | Public API and compile-time configuration.    |
 | `ftp_server.c`  | Server implementation (session/state machine, command dispatch, data transfer). |
+| `DESIGN.md`     | Design/architecture notes — behaviour rationale and RFC references. |
 
 ## Requirements
 
@@ -62,7 +63,7 @@ Override any of these macros before including `ftp_server.h` (e.g. via a `-D` co
 | `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes).     |
 | `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length.                     |
 | `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must be >= `lfs_config.cache_size` (checked at `ftp_server_init()`). |
-| `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected. Traffic on either the control *or* the data connection counts as activity, so a long transfer is never cut short — only a stalled one. |
+| `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected (see [DESIGN.md](DESIGN.md#resource-model)). |
 
 ## Usage
 
@@ -101,27 +102,11 @@ Then connect with any standard FTP client:
 ftp <device-ip>
 ```
 
-If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credentials; otherwise any `USER`/`PASS` is accepted. With both defined, a wrong username is not rejected until `PASS` — see the note on RFC 2577 §3 below.
+If `FTP_SERVER_USER`/`FTP_SERVER_PASS` are defined, log in with those credentials; otherwise any `USER`/`PASS` is accepted. With both defined, a wrong username is not rejected until `PASS` — see the RFC 2577 §3 note in [DESIGN.md](DESIGN.md#security).
 
-## Notes
+## Design
 
-- Only one data connection is active per session at a time. A transfer command issued while another is still pending is answered `450 Transfer already in progress`; `PASV` and `ABOR` both reset the state.
-- Each session's LFS file cache buffer (`FTP_SERVER_FILE_CACHE_SIZE`) must be >= `lfs_config.cache_size`; `ftp_server_init()` returns `ERR_ARG` otherwise.
-- Designed for constrained targets: no dynamic allocation beyond the static `s_sessions[FTP_SERVER_MAX_CLIENTS]` table.
-- Transfers are byte-transparent: no CRLF translation is performed in either direction. `TYPE A` and `TYPE I` are both accepted (RFC 959 §3.1.1.1 makes ASCII mandatory and the default) with an optional `N` format parameter, and behave identically — the reply to `TYPE A` says so rather than claiming a conversion that does not happen. Every other type is refused with `504`. `MODE` and `STRU` are accepted for their RFC 959 §5.1 default values (`S` and `F`) and refused with `504` otherwise.
-- Telnet control sequences are stripped from the control connection before a command is parsed. RFC 959 §4.1 has clients precede an in-transfer command with `IAC IP` + `IAC DM`, and lwIP delivers those bytes inline, so without this every conforming `ABOR` would read as an unknown command.
-- Both data-connection directions are pinned to the client ([RFC 2577](https://www.rfc-editor.org/rfc/rfc2577)): `PORT` only accepts the control connection's own peer address (FTP-bounce mitigation, `501` otherwise), and a `PASV` data connection arriving from any other host is dropped, so nobody on the network can race the client onto the passive port and take over the transfer. If the peer cannot be determined, both fail closed.
-- `FEAT` is answered before login (RFC 2389 §3) — clients use the feature list to decide what to send during the login sequence. Everything else except `USER`, `PASS` and `QUIT` needs credentials.
-- When both `FTP_SERVER_USER` and `FTP_SERVER_PASS` are configured, every `USER` is answered `331` and the verdict is deferred to `PASS` ([RFC 2577](https://www.rfc-editor.org/rfc/rfc2577) §3). There is only ever one valid user name, so rejecting a wrong one at `USER` would hand it to an attacker for free. With `FTP_SERVER_USER` alone there is no later step to defer to, and `USER` necessarily answers `230`/`530` outright.
-- A send that lwIP cannot queue at all is retried from a `tcp_poll` on the data connection. `tcp_write()` returns `ERR_MEM` both for a full send window — where the peer's ACK brings the `tcp_sent` callback along to resume the transfer — and for an exhausted pbuf/segment pool, where it queues nothing, so no ACK and no `tcp_sent` ever follow. Without the poll a `RETR`/`LIST` unlucky enough to hit the second case would sit untouched until the idle timeout killed the whole session.
-- Listing entries are queued with one `tcp_write()` each but pushed with a single `tcp_output()`, so lwIP can coalesce a directory's worth of ~55-byte lines into full segments instead of dribbling out one per entry.
-- A pending `RNFR` is cancelled by any intervening command, including `USER`, `PASS` and `QUIT`, so a rename cannot survive a re-login and be completed under different credentials.
-- Pathnames in `257` replies (`PWD`, `MKD`) are quoted with the RFC 959 Appendix II quote-doubling convention, so a name containing `"` still parses.
-- A connection arriving with every session slot taken is answered `421 Too many users, try again later.` and closed, rather than reset.
-- `DELE` refuses directories and `RMD` refuses regular files, even though littlefs removes both with `lfs_remove()`.
-- A client that opens the data connection and starts sending before its `STOR` has been processed does not lose the head of the upload: the pbuf is refused rather than discarded, which parks it in lwIP's `pcb->refused_data` until the command arms the transfer (`tcp_fasttmr` re-offers it every 250 ms). Costs no buffer of its own, and does not count as activity, so a connection that only ever sends unsolicited data still hits the idle timeout.
-- A filesystem error part-way through a transfer ends it with `451`; a data-connection reset, an unusable data socket, or a download the client closes early all end it with `426` — never a misleading `226`. A client closing the data connection only means "transfer complete" for an upload (`STOR`), and only if the final `lfs_file_close()` flush succeeds — littlefs writes the tail of a file there, so a volume that fills up on the last chunk is reported as `451` rather than `226`.
-- Path resolution normalises `.`/`..` straight into the result buffer, so `FTP_SERVER_PATH_MAX` bounds the *resolved* path: `CWD ../short` works from a directory too deep for `cwd + "/../short"` to fit. A single component that cannot itself be buffered is still rejected with `550`.
+Behavioural details — transfer semantics, resource limits, the RFC 2577 data-connection and login hardening, and the lwIP/littlefs quirks they follow from — are documented in [DESIGN.md](DESIGN.md).
 
 ## Continuous Integration
 
