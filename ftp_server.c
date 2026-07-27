@@ -287,9 +287,9 @@ static char *ftp_put_uint(char *dst, const char *const end, unsigned long val,
  * __ctype_ptr__ for a table lookup that a two-branch comparison replaces
  * outright. FTP commands, TYPE/MODE/STRU codes and Telnet option bytes are
  * all ASCII by definition (RFC 959), so there is no locale to respect. */
-static char ftp_toupper(unsigned char c)
+static unsigned char ftp_toupper(unsigned char c)
 {
-    return (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : (char)c;
+    return (c >= 'a' && c <= 'z') ? (unsigned char)(c - 'a' + 'A') : c;
 }
 
 /** Case-insensitive strcmp — strcasecmp is POSIX, not C99. */
@@ -1244,7 +1244,7 @@ static void cmd_noop(ftp_session_t *s, const char *arg)
  * Match a transfer-parameter argument against a single Telnet character code,
  * case-insensitively. TYPE, MODE and STRU all take exactly one such letter.
  */
-static int ftp_arg_is_code(const char *arg, char code)
+static int ftp_arg_is_code(const char *arg, unsigned char code)
 {
     return arg && ftp_toupper((unsigned char)arg[0]) == code && arg[1] == '\0';
 }
@@ -1259,7 +1259,7 @@ static int ftp_arg_is_code(const char *arg, char code)
  */
 static void cmd_type(ftp_session_t *s, const char *arg)
 {
-    char code = arg ? ftp_toupper((unsigned char)arg[0]) : '\0';
+    unsigned char code = arg ? ftp_toupper((unsigned char)arg[0]) : (unsigned char)'\0';
     /* ASCII and EBCDIC take an optional format parameter; only the default,
      * Non-print, is meaningful here (section 3.1.1.5.1). */
     int ok = (code == 'A' || code == 'I') &&
@@ -1376,7 +1376,11 @@ static void cmd_pasv(ftp_session_t *s, const char *arg)
         return;
     }
 
-    uint32_t ip4 = ip_addr_get_ip4_u32(&local_ip);
+    /* Take the address through a pointer variable: lwIP's accessor macros
+     * NULL-check their argument, and passing &local so directly makes GCC's
+     * -Waddress fire on a test the macro has to keep for other callers. */
+    const ip_addr_t *local_ip_p = &local_ip;
+    uint32_t ip4 = ip_addr_get_ip4_u32(local_ip_p);
     uint8_t *ip  = (uint8_t *)&ip4;
 
     char *const end = s_reply + sizeof(s_reply) - 1;
@@ -1445,7 +1449,8 @@ static void cmd_port(ftp_session_t *s, const char *arg)
     }
 
     ip_addr_t addr;
-    IP_ADDR4(&addr, fields[0], fields[1], fields[2], fields[3]);
+    ip_addr_t *addr_p = &addr;   /* see cmd_pasv(): keeps -Waddress quiet */
+    IP_ADDR4(addr_p, fields[0], fields[1], fields[2], fields[3]);
 
     /* RFC 2577: refuse to open a data connection to anywhere other than the
      * client itself, so the server cannot be used as an "FTP bounce" proxy.
@@ -1867,7 +1872,7 @@ static char *ftp_strip_telnet(char *line, uint16_t len)
          * than skipped through to its IAC SE terminator: a subnegotiation
          * payload, if a client ever sent one on the command channel, leaks
          * into the command line instead of being stripped. */
-        i += (cmd >= FTP_TELNET_WILL && cmd <= FTP_TELNET_DONT) ? 2 : 1;
+        i = (uint16_t)(i + ((cmd >= FTP_TELNET_WILL && cmd <= FTP_TELNET_DONT) ? 2 : 1));
     }
 
     *dst = '\0';
