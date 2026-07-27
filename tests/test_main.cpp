@@ -551,16 +551,24 @@ TEST_CASE("USER logs in immediately when no auth is configured", "[auth]")
     REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
 }
 
-TEST_CASE("PASS without USER first is rejected", "[auth]")
+TEST_CASE("PASS is superfluous but accepted when no credentials are configured",
+          "[auth][regression]")
 {
+    /* Given a build with authentication disabled, every client is logged in
+     * the moment it connects. A client that still sends USER and PASS
+     * unconditionally — plenty of scripted ones do, without waiting for the
+     * 331 that would ask for it — must not be answered with a sequencing
+     * error for a password the server does not want. */
     init_server();
     Client c = connect_client();
 
-    /* Without credentials the client is already logged in, so no PASS is
-     * awaited -> 503. */
-    REQUIRE(send_cmd(c, "PASS whatever\r\n") == "503 Login with USER first.\r\n");
+    REQUIRE(send_cmd(c, "PASS whatever\r\n") == "230 Login successful.\r\n");
     REQUIRE(send_cmd(c, "USER anyone\r\n") == "230 Login successful.\r\n");
-    REQUIRE(send_cmd(c, "PASS whatever\r\n") == "503 Login with USER first.\r\n");
+    REQUIRE(send_cmd(c, "PASS whatever\r\n") == "230 Login successful.\r\n");
+
+    /* And the session is usable throughout — the 230 is not a consolation
+     * reply that leaves the client logged out. */
+    REQUIRE(send_cmd(c, "SYST\r\n") == "215 UNIX Type: L8\r\n");
 }
 
 /* ==================================================================== */
@@ -1122,6 +1130,44 @@ TEST_CASE("PORT refuses an address other than the client's", "[port][security]")
             "501 PORT address must match the control connection.\r\n");
 
     /* And no data channel was armed by the rejected command. */
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("PORT refuses a privileged data port", "[port][security][regression]")
+{
+    /* Given the address check only pins the data connection to the client's
+     * host, the port is still free to name any service *on* that host. RFC
+     * 2577 section 3 closes the rest of the hole: a data connection may not
+     * target a privileged port, so the server cannot be talked into speaking
+     * to the client's SMTP or telnet port with attacker-chosen payload. */
+    init_server();
+    Client c = connect_client();
+
+    SECTION("port 0 is not an endpoint at all") {
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,0,0\r\n") ==
+                "501 Data port must be above 1023.\r\n");
+    }
+    SECTION("a well-known service port is refused") {
+        /* 0,25 = SMTP, the classic FTP-bounce mail relay. */
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,0,25\r\n") ==
+                "501 Data port must be above 1023.\r\n");
+    }
+    SECTION("the last privileged port is refused") {
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,3,255\r\n") == /* 1023 */
+                "501 Data port must be above 1023.\r\n");
+    }
+    SECTION("the first unprivileged port is accepted") {
+        REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,0\r\n") == /* 1024 */
+                "200 PORT command successful.\r\n");
+    }
+}
+
+TEST_CASE("a refused PORT leaves no data channel armed", "[port][security]")
+{
+    init_server();
+    Client c = connect_client();
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,0,25\r\n") ==
+            "501 Data port must be above 1023.\r\n");
     REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
 }
 
@@ -2963,4 +3009,280 @@ TEST_CASE("a listener that fails to close is not aborted", "[lwip]")
 
     /* Only the connected data PCB may be aborted — never the listener. */
     REQUIRE(s_aborts == 0);
+}
+
+/* ==================================================================== */
+/*  Regression: fixes from the 2024 review                              */
+/* ==================================================================== */
+
+TEST_CASE("a download whose close degrades to an abort is not reported complete",
+          "[transfer][regression]")
+{
+    /* Given a RETR that reaches EOF, but whose data connection cannot be
+     * closed gracefully — tcp_close() fails when lwIP cannot allocate the
+     * segment carrying the FIN, and ftp_close_pcb() then falls back to
+     * tcp_abort(), which sends an RST. Everything still unacknowledged is
+     * lost with it. */
+    init_server();
+    Client c = connect_client();
+
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
+    g_retr_text = "hello world";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR file.txt\r\n").empty());
+
+    /* Only the data connection fails to close; the control connection has to
+     * stay usable, or there is nothing left to report the failure on. */
+    static struct tcp_pcb *s_ctrl_pcb;
+    s_ctrl_pcb = c.pcb;
+    mock_tcp_close_fn = [](struct tcp_pcb *pcb) -> err_t {
+        return (pcb == s_ctrl_pcb) ? ERR_OK : ERR_MEM;
+    };
+
+    u16_t before = mock_tcp_write_len;
+    (void)accept_pasv_data_connection();
+    std::string out = written_since(before);
+    mock_tcp_close_fn = nullptr;
+
+    /* When the transfer ends, the client is told the truth: the bytes went
+     * out, but the connection was reset before they could be acknowledged,
+     * so "226 Transfer complete" would call a short file a whole one. */
+    REQUIRE(out.find("hello world") != std::string::npos);
+    REQUIRE(out.find("226 Transfer complete.") == std::string::npos);
+    REQUIRE(out.find("426 Connection closed; transfer aborted.\r\n") !=
+            std::string::npos);
+}
+
+TEST_CASE("an aborted data channel does not taint the next transfer",
+          "[transfer][regression]")
+{
+    /* The abort bookkeeping the previous test relies on is per-connection
+     * state that outlives the connection it describes: the transfer after an
+     * aborted one closes cleanly and must be reported as complete. */
+    init_server();
+    Client c = connect_client();
+
+    /* An ABOR whose data-channel close degrades to an abort sets the flag. */
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    (void)accept_pasv_data_connection();
+    mock_tcp_close_fn = [](struct tcp_pcb *) -> err_t { return ERR_MEM; };
+    (void)send_cmd(c, "ABOR\r\n");
+    mock_tcp_close_fn = nullptr;
+
+    /* The next transfer closes cleanly and must be reported as complete. */
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
+    g_retr_text = "hello world";
+    read_once(nullptr, nullptr, nullptr, 0); /* reset */
+    mock_lfs_file_read_fn = read_once;
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "RETR file.txt\r\n").empty());
+
+    u16_t before = mock_tcp_write_len;
+    (void)accept_pasv_data_connection();
+    std::string out = written_since(before);
+
+    REQUIRE(out.find("226 Transfer complete.\r\n") != std::string::npos);
+    REQUIRE(out.find("426 ") == std::string::npos);
+}
+
+TEST_CASE("an active-mode data PCB is bound before it is connected",
+          "[transfer][port][regression]")
+{
+    /* Given tcp_connect() can fail after it has picked a local port but
+     * before it registers the PCB anywhere, the tcp_close() that cleans up
+     * would run lwIP's CLOSED-state path, which unlinks such a PCB from
+     * tcp_bound_pcbs unconditionally — a list it is not on, tripping lwIP's
+     * own TCP_RMV assertion. Binding first puts it there. */
+    init_server();
+    Client c = connect_client();
+
+    static struct tcp_pcb *s_bound_pcb;
+    static u16_t           s_bound_port;
+    static struct tcp_pcb *s_connect_pcb;
+    static bool            s_bound_before_connect;
+    s_bound_pcb = nullptr;
+    s_bound_port = 0xffff;
+    s_connect_pcb = nullptr;
+    s_bound_before_connect = false;
+
+    mock_tcp_bind_fn = [](struct tcp_pcb *pcb, const ip_addr_t *, u16_t port) -> err_t {
+        s_bound_pcb  = pcb;
+        s_bound_port = port;
+        return ERR_OK;
+    };
+    mock_tcp_connect_fn = [](struct tcp_pcb *pcb, const ip_addr_t *, u16_t,
+                             tcp_connected_fn) -> err_t {
+        s_connect_pcb          = pcb;
+        s_bound_before_connect = (s_bound_pcb == pcb);
+        return ERR_OK;
+    };
+
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") ==
+            "200 PORT command successful.\r\n");
+    REQUIRE(send_cmd(c, "LIST\r\n").empty()); /* async: awaiting connect */
+
+    mock_tcp_bind_fn    = nullptr;
+    mock_tcp_connect_fn = nullptr;
+
+    REQUIRE(s_connect_pcb != nullptr);
+    REQUIRE(s_bound_before_connect);
+    /* Port 0 — lwIP picks the ephemeral port, exactly as tcp_connect() would
+     * have, but the PCB lands on the bound list while doing so. */
+    REQUIRE(s_bound_port == 0);
+}
+
+TEST_CASE("a data PCB that cannot be bound fails the transfer with 425",
+          "[transfer][port][regression]")
+{
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PORT 192,168,1,1,4,2\r\n") ==
+            "200 PORT command successful.\r\n");
+
+    static int s_connects;
+    s_connects = 0;
+    mock_tcp_bind_fn = [](struct tcp_pcb *, const ip_addr_t *, u16_t) -> err_t {
+        return ERR_USE;
+    };
+    mock_tcp_connect_fn = [](struct tcp_pcb *, const ip_addr_t *, u16_t,
+                             tcp_connected_fn) -> err_t {
+        s_connects++;
+        return ERR_OK;
+    };
+
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Can't open data connection.\r\n");
+
+    mock_tcp_bind_fn    = nullptr;
+    mock_tcp_connect_fn = nullptr;
+
+    /* No connect was attempted on an unbound PCB, and the armed transfer was
+     * released rather than left holding the directory handle. */
+    REQUIRE(s_connects == 0);
+    REQUIRE(send_cmd(c, "LIST\r\n") == "425 Use PASV or PORT first.\r\n");
+}
+
+TEST_CASE("an undeliverable 425 releases the session", "[transfer]")
+{
+    /* A transfer command with no data channel armed releases the transfer
+     * before sending its 425, because an undeliverable reply tears the whole
+     * session down from inside ftp_send_reply() and everything after it would
+     * be operating on a slot that has already been handed back. Pins the
+     * outcome either way: the session is gone and its slot is reusable. */
+    init_server();
+    Client c = connect_client();
+
+    static struct tcp_pcb *s_ctrl_pcb;
+    s_ctrl_pcb = c.pcb;
+    /* The control connection can no longer take a byte. */
+    c.pcb->snd_buf = 0;
+    mock_tcp_track_sndbuf = 1;
+
+    REQUIRE(send_cmd(c, "LIST\r\n").empty());
+    mock_tcp_track_sndbuf = 0;
+
+    /* The session was released and its slot is reusable. */
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+    Client c2 = connect_client();
+    REQUIRE(send_cmd(c2, "NOOP\r\n") == "200 NOOP ok.\r\n");
+    (void)s_ctrl_pcb;
+}
+
+TEST_CASE("opening a data connection resets the idle counter",
+          "[transfer][connect][regression]")
+{
+    /* A client that spends most of the timeout window negotiating and then
+     * opens its data connection has made progress; the transfer must get a
+     * full window of its own rather than inheriting a nearly expired one. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+    REQUIRE(send_cmd(c, "STOR upload.bin\r\n").empty());
+
+    for (int i = 0; i < FTP_SERVER_IDLE_TIMEOUT_POLLS - 1; i++) {
+        mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    }
+
+    struct tcp_pcb *data_pcb = accept_pasv_data_connection();
+    int data_idx = mock_tcp_pcb_index(data_pcb);
+
+    /* One more poll would have been the last one before the fix. */
+    mock_tcp_cb_poll[c.idx](mock_tcp_cb_arg[c.idx], c.pcb);
+    REQUIRE(mock_tcp_cb_recv[c.idx] != nullptr);
+
+    u16_t before = mock_tcp_write_len;
+    mock_tcp_cb_recv[data_idx](mock_tcp_cb_arg[data_idx], data_pcb, nullptr, ERR_OK);
+    REQUIRE(written_since(before) == "226 Transfer complete.\r\n");
+}
+
+TEST_CASE("file and directory transfers alternate on one session",
+          "[transfer][regression]")
+{
+    /* The session's lfs_file_t and lfs_dir_t share their storage — never both
+     * at once, because ftp_transfer_busy() refuses a second transfer while
+     * either handle is open. That only holds if every completed transfer
+     * hands its handle back, so alternate the two kinds and check both the
+     * close bookkeeping and the payloads. */
+    init_server();
+    Client c = connect_client();
+
+    static int s_files_open;
+    static int s_dirs_open;
+    s_files_open = 0;
+    s_dirs_open  = 0;
+    mock_lfs_file_opencfg_fn = [](lfs_t *, lfs_file_t *, const char *, int,
+                                  const struct lfs_file_config *) -> int {
+        /* Two handles live at once would mean the union is being aliased. */
+        REQUIRE(s_dirs_open == 0);
+        s_files_open++;
+        return 0;
+    };
+    mock_lfs_file_close_fn = [](lfs_t *, lfs_file_t *) -> int {
+        s_files_open--;
+        return 0;
+    };
+    mock_lfs_dir_open_fn = [](lfs_t *, lfs_dir_t *, const char *) -> int {
+        REQUIRE(s_files_open == 0);
+        s_dirs_open++;
+        return 0;
+    };
+    mock_lfs_dir_close_fn = [](lfs_t *, lfs_dir_t *) -> int {
+        s_dirs_open--;
+        return 0;
+    };
+    mock_lfs_file_size_fn = [](lfs_t *, lfs_file_t *) -> lfs_soff_t { return 11; };
+
+    for (int round = 0; round < 2; round++) {
+        INFO("round " << round);
+
+        /* LIST */
+        dir_read_two_entries(nullptr, nullptr, nullptr); /* reset */
+        mock_lfs_dir_read_fn = dir_read_two_entries;
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "LIST\r\n").empty());
+        u16_t before = mock_tcp_write_len;
+        (void)accept_pasv_data_connection();
+        std::string listing = written_since(before);
+        REQUIRE(listing.find("foo.txt\r\n") != std::string::npos);
+        REQUIRE(listing.find("226 Transfer complete.\r\n") != std::string::npos);
+        REQUIRE(s_dirs_open == 0);
+
+        /* RETR */
+        g_retr_text = "hello world";
+        read_once(nullptr, nullptr, nullptr, 0); /* reset */
+        mock_lfs_file_read_fn = read_once;
+        REQUIRE(send_cmd(c, "PASV\r\n").rfind("227", 0) == 0);
+        REQUIRE(send_cmd(c, "RETR file.txt\r\n").empty());
+        before = mock_tcp_write_len;
+        (void)accept_pasv_data_connection();
+        std::string download = written_since(before);
+        REQUIRE(download.find("hello world") != std::string::npos);
+        REQUIRE(download.find("226 Transfer complete.\r\n") != std::string::npos);
+        REQUIRE(s_files_open == 0);
+    }
 }

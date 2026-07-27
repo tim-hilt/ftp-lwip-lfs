@@ -10,9 +10,9 @@ A minimal FTP server for embedded systems, built on the [lwIP](https://savannah.
 - Event-driven, non-blocking implementation using lwIP's raw (callback) API — no RTOS or blocking sockets required.
 - Serves files directly from an already-mounted LittleFS (`lfs_t`) instance.
 - Supports both passive (PASV) and active (PORT) data connections.
-- Optional username/password authentication.
+- Optional username/password authentication, with a per-connection limit on failed logins.
 - Configurable number of concurrent client sessions.
-- Commands supported: `USER`, `PASS`, `SYST`, `FEAT`, `OPTS`, `TYPE`, `MODE`, `STRU`, `PWD`/`XPWD`, `CWD`/`XCWD`, `CDUP`/`XCUP`, `PASV`, `PORT`, `LIST`, `NLST`, `RETR`, `STOR`, `DELE`, `MKD`/`XMKD`, `RMD`/`XRMD`, `RNFR`, `RNTO`, `SIZE`, `NOOP`, `QUIT`, `ABOR`.
+- Commands supported: `USER`, `PASS`, `SYST`, `FEAT`, `OPTS`, `TYPE`, `MODE`, `STRU`, `PWD`/`XPWD`, `CWD`/`XCWD`, `CDUP`/`XCUP`, `PASV`, `PORT`, `LIST`, `NLST`, `RETR`, `STOR`, `DELE`, `MKD`/`XMKD`, `RMD`/`XRMD`, `RNFR`, `RNTO`, `SIZE`, `NOOP`, `QUIT`, `ABOR` (the `X`-prefixed aliases are optional, see `FTP_SERVER_ENABLE_X_COMMANDS`).
 
 ## Files
 
@@ -59,11 +59,15 @@ Override any of these macros before including `ftp_server.h` (e.g. via a `-D` co
 | `FTP_SERVER_MAX_CLIENTS`          | `2`     | Maximum concurrent sessions.                      |
 | `FTP_SERVER_USER`                 | `NULL`  | Required username, or `NULL` to skip auth.        |
 | `FTP_SERVER_PASS`                 | `NULL`  | Required password, or `NULL` to skip auth.        |
+| `FTP_SERVER_MAX_LOGIN_ATTEMPTS`   | `3`     | Failed logins tolerated on one control connection before it is dropped with `421`; `0` disables the limit (see [DESIGN.md](DESIGN.md#security)). |
 | `FTP_SERVER_DATA_BUF_SIZE`        | `512`   | Per-session transfer buffer size (bytes); minimum 64. A LIST line is 47 bytes plus the name, so anything at or below `47 + LFS_NAME_MAX` truncates listings of the longest names. |
-| `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes).     |
+| `FTP_SERVER_CMD_BUF_SIZE`         | `256`   | Per-session command line buffer size (bytes); minimum 16. |
 | `FTP_SERVER_PATH_MAX`             | `256`   | Maximum resolved path length; minimum 16.         |
 | `FTP_SERVER_FILE_CACHE_SIZE`      | `256`   | LFS file cache per session — must be >= `lfs_config.cache_size` (checked at `ftp_server_init()`). |
 | `FTP_SERVER_IDLE_TIMEOUT_POLLS`   | `60`    | `tcp_poll` intervals (~5 s each) before an idle session is disconnected (see [DESIGN.md](DESIGN.md#resource-model)). |
+| `FTP_SERVER_ENABLE_X_COMMANDS`    | `1`     | Accept the obsolete RFC 775 aliases `XPWD`/`XCWD`/`XCUP`/`XMKD`/`XRMD`; `0` drops five dispatch-table entries. |
+
+`ftp_server_init()` and `ftp_server_deinit()` are raw-API calls like every callback in this file: call them from the lwIP thread, or with the core lock held.
 
 ## Usage
 
@@ -131,7 +135,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Several configuration macros are compile-time constants, so the paths they guard cannot all be reached from a single build. CMake therefore produces five executables, each linked against its own copy of the library:
+Several configuration macros are compile-time constants, so the paths they guard cannot all be reached from a single build. CMake therefore produces six executables, each linked against its own copy of the library:
 
 | Executable             | Library configuration                 | Covers                                     |
 |------------------------|---------------------------------------|--------------------------------------------|
@@ -140,8 +144,9 @@ Several configuration macros are compile-time constants, so the paths they guard
 | `ftp_tests_user_only`  | `FTP_SERVER_USER` only                | `tests/test_auth.cpp` — USER logs in        |
 | `ftp_tests_short_path` | `FTP_SERVER_PATH_MAX=64`              | `tests/test_path_limits.cpp` — path overflow, unreachable while `FTP_SERVER_PATH_MAX` equals `FTP_SERVER_CMD_BUF_SIZE` |
 | `ftp_tests_short_data` | `FTP_SERVER_DATA_BUF_SIZE=64`         | `tests/test_list_truncation.cpp` — a LIST line too long for the transfer buffer |
+| `ftp_tests_no_x`       | `FTP_SERVER_ENABLE_X_COMMANDS=0`      | `tests/test_no_x_commands.cpp` — the aliases are gone and nothing else with them |
 
-The `coverage` job merges the `.gcda` files from all five, so the reported figure covers the credential and overflow paths too. `tests/ftp_test_support.hpp` holds the shared harness that drives ftp_server.c's registered lwIP callbacks.
+The `coverage` job merges the `.gcda` files from all six, so the reported figure covers the credential and overflow paths too. `tests/ftp_test_support.hpp` holds the shared harness that drives ftp_server.c's registered lwIP callbacks.
 
 ## Static Analysis
 

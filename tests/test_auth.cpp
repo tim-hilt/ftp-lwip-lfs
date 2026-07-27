@@ -250,3 +250,62 @@ TEST_CASE("USER can be re-issued to restart authentication", "[auth]")
     login(c);
     REQUIRE(send_cmd(c, "PWD\r\n") == "257 \"/\" is the current directory.\r\n");
 }
+
+/** Drive one failed login and return the reply. */
+namespace {
+std::string fail_login(const Client &c)
+{
+    if constexpr (kPasswordRequired) {
+        REQUIRE(send_cmd(c, std::string("USER ") + kUser + "\r\n") ==
+                "331 Please specify the password.\r\n");
+        return send_cmd(c, "PASS wrong\r\n");
+    } else {
+        return send_cmd(c, "USER intruder\r\n");
+    }
+}
+} // namespace
+
+TEST_CASE("repeated failed logins drop the connection", "[auth][security][regression]")
+{
+    /* RFC 2577 section 5: without a cap the only thing bounding a password
+     * guessing run is the idle timer — and every guess resets it, so the real
+     * bound is "until the client gives up". */
+    REQUIRE(FTP_SERVER_MAX_LOGIN_ATTEMPTS == 3); /* the default this test assumes */
+
+    init_server();
+    Client c = connect_client();
+
+    /* The attempts below the limit are answered normally. */
+    for (int i = 0; i < FTP_SERVER_MAX_LOGIN_ATTEMPTS - 1; i++) {
+        INFO("attempt " << i);
+        REQUIRE(fail_login(c) == "530 Login incorrect.\r\n");
+        REQUIRE(mock_tcp_cb_recv[c.idx] != nullptr);
+    }
+
+    /* The last one is answered and the connection is closed behind it. */
+    REQUIRE(fail_login(c) == "421 Too many failed login attempts.\r\n");
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+    REQUIRE(mock_tcp_cb_arg[c.idx] == nullptr);
+
+    /* The slot is released, so a legitimate client can still get in — the
+     * limit is per control connection, not a lockout. */
+    Client c2 = connect_client();
+    login(c2);
+    REQUIRE(send_cmd(c2, "SYST\r\n") == "215 UNIX Type: L8\r\n");
+}
+
+TEST_CASE("a successful login does not clear the failure count",
+          "[auth][security][regression]")
+{
+    /* The limit bounds the connection, not one attempt sequence: a guessing
+     * client that happens to stumble on a valid login must not be handed a
+     * fresh allowance by it. */
+    init_server();
+    Client c = connect_client();
+
+    REQUIRE(fail_login(c) == "530 Login incorrect.\r\n");
+    login(c);
+    REQUIRE(fail_login(c) == "530 Login incorrect.\r\n");
+    REQUIRE(fail_login(c) == "421 Too many failed login attempts.\r\n");
+    REQUIRE(mock_tcp_cb_recv[c.idx] == nullptr);
+}

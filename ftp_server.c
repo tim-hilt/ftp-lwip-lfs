@@ -99,18 +99,20 @@ typedef struct ftp_session {
     /* File cache for lfs_file_opencfg (avoids heap allocation) */
     struct lfs_file_config file_cfg;
 
-    /* File / directory being transferred */
-    lfs_dir_t             dir;
-    lfs_file_t            file;
+    /* File / directory being transferred. Never both at once:
+     * ftp_transfer_busy() refuses a second transfer command while either
+     * handle is open, and no command opens both, so the two share their
+     * storage. lfs_dir_t alone is 40-56 bytes per session. */
+    union {
+        lfs_dir_t  dir;
+        lfs_file_t file;
+    } h;
 
     /* Authentication */
     ftp_auth_state_t      auth;
 
     /* Data connection ------------------------------------------------ */
     ftp_data_mode_t       data_mode;
-
-    /* Active mode target */
-    ip_addr_t             port_addr;
 
     /* RETR: size reported in the "150" reply */
     lfs_soff_t            retr_size;
@@ -124,6 +126,9 @@ typedef struct ftp_session {
 
     /* Idle timeout poll counter */
     uint16_t              idle_polls;
+
+    /* Failed logins on this control connection; see ftp_login_failed(). */
+    uint8_t               login_fails;
 
     uint8_t               in_use;
 
@@ -256,7 +261,10 @@ static char *ftp_put_str(char *dst, const char *const end, const char *src)
 static char *ftp_put_uint(char *dst, const char *const end, unsigned long val,
                           unsigned width)
 {
-    char     digits[20];   /* 2^64 is 20 decimal digits */
+    /* Three decimal digits per octet is always enough (log10(256) < 3), so
+     * this tracks unsigned long without reserving a 64-bit frame on a target
+     * where it is 32 bits wide. */
+    char     digits[sizeof(unsigned long) * 3];
     unsigned n = 0;
     do {
         digits[n++] = (char)('0' + (val % 10));
@@ -614,11 +622,11 @@ static void ftp_send_reply_uint(ftp_session_t *s, const char *pre,
 static void ftp_release_transfer(ftp_session_t *s)
 {
     if (s->file_open) {
-        lfs_file_close(s_lfs, &s->file);
+        lfs_file_close(s_lfs, &s->h.file);
         s->file_open = 0;
     }
     if (s->dir_open) {
-        lfs_dir_close(s_lfs, &s->dir);
+        lfs_dir_close(s_lfs, &s->h.dir);
         s->dir_open = 0;
     }
     s->data_mode    = FTP_DATA_IDLE;
@@ -669,7 +677,7 @@ static void ftp_abort_transfer(ftp_session_t *s)
 /**
  * Reject a transfer command while another transfer is still set up.
  *
- * Re-opening s->file / s->dir without closing them first would add the same
+ * Re-opening s->h.file / s->h.dir without closing them first would add the same
  * node to littlefs's intrusive list of open handles twice, making it point
  * at itself and corrupting every later traversal. PASV and ABOR reset the
  * state, so a client always has a way out.
@@ -737,7 +745,7 @@ static int ftp_send_pending(ftp_session_t *s)
 static int ftp_fill_next_chunk(ftp_session_t *s)
 {
     if (s->data_mode == FTP_DATA_RETR) {
-        lfs_ssize_t r = lfs_file_read(s_lfs, &s->file,
+        lfs_ssize_t r = lfs_file_read(s_lfs, &s->h.file,
                                        s->data_buf, FTP_SERVER_DATA_BUF_SIZE);
         if (r < 0) return FTP_CHUNK_ERR;
         return (r == 0) ? FTP_CHUNK_EOF : (int)r;
@@ -751,7 +759,7 @@ static int ftp_fill_next_chunk(ftp_session_t *s)
 
     for (;;) {
         struct lfs_info info;
-        int r = lfs_dir_read(s_lfs, &s->dir, &info);
+        int r = lfs_dir_read(s_lfs, &s->h.dir, &info);
         if (r < 0) return FTP_CHUNK_ERR;
         if (r == 0) return FTP_CHUNK_EOF;
 
@@ -823,9 +831,16 @@ static void ftp_send_next_data(ftp_session_t *s)
 
         int n = ftp_fill_next_chunk(s);
         if (n < 0) {
+            const char *reply = (n == FTP_CHUNK_ERR) ? ftp_reply_local_err
+                                                     : ftp_reply_complete;
             ftp_close_data(s);
-            ftp_send_reply(s, (n == FTP_CHUNK_ERR) ? ftp_reply_local_err
-                                                   : ftp_reply_complete);
+            /* tcp_close() could not queue the FIN, so ftp_close_pcb() had to
+             * abort the connection instead: the peer gets an RST and loses
+             * whatever was still unacknowledged. The bytes were handed to
+             * lwIP, but they demonstrably did not all arrive, and "226" for a
+             * download the client received short is the one wrong answer. */
+            if (s->data_aborted) reply = ftp_reply_aborted;
+            ftp_send_reply(s, reply);
             return;
         }
 
@@ -871,6 +886,19 @@ static err_t ftp_data_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 static void ftp_start_transfer(ftp_session_t *s)
 {
     if (!s->data_pcb) return;
+
+    /* Opening the data connection is progress on the session as a whole; the
+     * idle timer counts silence on both channels (see ftp_ctrl_poll()). */
+    s->idle_polls = 0;
+
+    /* Defensive: ftp_send_next_data() reads data_aborted to tell a completed
+     * transfer from one whose close degraded to an abort, and every *data*
+     * callback clears the flag on entry. This function can also be reached
+     * from a control callback (a PASV client that connected before issuing
+     * the transfer command), which does not — so the invariant is restated
+     * here rather than left to rest on the argument that no reachable path
+     * can set the flag and then land in that branch. */
+    s->data_aborted = 0;
 
     if (s->data_mode == FTP_DATA_STOR) {
         ftp_send_reply(s, "150 Ok to send data.\r\n");
@@ -921,7 +949,23 @@ static void ftp_begin_transfer(ftp_session_t *s)
              * leave lwIP holding callbacks into a recycled session. */
             s->data_pcb        = pcb;
             s->data_connecting = 1;
-            if (tcp_connect(pcb, &s->port_addr, s->port_port,
+
+            /* Bind before connecting, even though tcp_connect() would pick an
+             * ephemeral port by itself. A tcp_connect() that fails at the SYN
+             * (ERR_MEM from an empty segment pool) leaves the PCB CLOSED with
+             * a local port it never registered anywhere, and the tcp_close()
+             * below then runs tcp_close_shutdown()'s CLOSED case, which
+             * unconditionally unlinks such a PCB from tcp_bound_pcbs — a list
+             * it is not on, tripping lwIP's own TCP_RMV assertion. tcp_bind()
+             * puts it on that list, so both outcomes are well-defined.
+             *
+             * cmd_port() accepts no target other than the control peer, so
+             * that address is re-read here rather than kept in a per-session
+             * ip_addr_t; it cannot have changed while the session lived. */
+            ip_addr_t peer;
+            if (tcp_bind(pcb, IP_ADDR_ANY, 0) == ERR_OK &&
+                ftp_peer_addr(s->ctrl_pcb, &peer) == 0 &&
+                tcp_connect(pcb, &peer, s->port_port,
                             ftp_data_connected) == ERR_OK) {
                 /* ftp_data_connected() will call ftp_start_transfer(). */
                 return;
@@ -942,8 +986,13 @@ static void ftp_begin_transfer(ftp_session_t *s)
         return;
     }
 
-    ftp_send_reply(s, "425 Use PASV or PORT first.\r\n");
+    /* Close before replying, like every other failure path here: an
+     * undeliverable reply tears the session down inside ftp_send_reply(), and
+     * the tear-down releases the transfer itself — so the other order leaves
+     * this function operating on a session that has already been handed back
+     * to ftp_alloc_session(). */
     ftp_close_data(s);
+    ftp_send_reply(s, "425 Use PASV or PORT first.\r\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1032,7 +1081,7 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * truncated upload as complete. */
         int flush_failed = 0;
         if (mode == FTP_DATA_STOR && s->file_open) {
-            flush_failed = (lfs_file_close(s_lfs, &s->file) < 0);
+            flush_failed = (lfs_file_close(s_lfs, &s->h.file) < 0);
             s->file_open = 0;
         }
 
@@ -1050,7 +1099,7 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         /* Write received data to LittleFS file. */
         struct pbuf *q;
         for (q = p; q != NULL; q = q->next) {
-            lfs_ssize_t w = lfs_file_write(s_lfs, &s->file,
+            lfs_ssize_t w = lfs_file_write(s_lfs, &s->h.file,
                                            q->payload, q->len);
             /* littlefs returns either the full count or a negative error —
              * the latter when a cache flush mid-pbuf hits a full volume.
@@ -1381,6 +1430,20 @@ static void cmd_port(ftp_session_t *s, const char *arg)
         return;
     }
 
+    uint16_t port = (uint16_t)(((unsigned)fields[4] << 8) | fields[5]);
+
+    /* RFC 2577 section 3: never point the data connection at a privileged
+     * port. Port 0 is not a listening endpoint at all, and 1..1023 are the
+     * well-known services no FTP client ever binds — but which an attacker
+     * who can open a control connection would happily have the server talk
+     * to, from the server's own address, in whatever bytes it can make the
+     * transfer carry. The address check below alone does not cover this:
+     * "the client's own host" includes the client's own privileged ports. */
+    if (port < 1024) {
+        ftp_send_reply(s, "501 Data port must be above 1023.\r\n");
+        return;
+    }
+
     ip_addr_t addr;
     IP_ADDR4(&addr, fields[0], fields[1], fields[2], fields[3]);
 
@@ -1401,8 +1464,10 @@ static void cmd_port(ftp_session_t *s, const char *arg)
     ftp_abort_transfer(s);
     if (!s->ctrl_pcb) return;
 
-    s->port_addr   = addr;
-    s->port_port   = (uint16_t)(((unsigned)fields[4] << 8) | fields[5]);
+    /* Only the port is kept: ftp_begin_transfer() re-reads the address from
+     * the control connection, which is the only address this check lets
+     * through anyway. */
+    s->port_port   = port;
     s->port_active = 1;
 
     ftp_send_reply(s, "200 PORT command successful.\r\n");
@@ -1423,7 +1488,7 @@ static void ftp_do_list(ftp_session_t *s, const char *arg, ftp_data_mode_t mode)
     const char *path = ftp_arg_path(s, list_arg, NULL);
     if (!path) return;
 
-    if (lfs_dir_open(s_lfs, &s->dir, path) < 0) {
+    if (lfs_dir_open(s_lfs, &s->h.dir, path) < 0) {
         ftp_send_reply(s, "550 Failed to open directory.\r\n");
         return;
     }
@@ -1458,7 +1523,7 @@ static int ftp_open_transfer(ftp_session_t *s, const char *arg,
     const char *path = ftp_arg_path(s, arg, ftp_reply_need_file);
     if (!path) return -1;
 
-    if (lfs_file_opencfg(s_lfs, &s->file, path, flags, &s->file_cfg) < 0) {
+    if (lfs_file_opencfg(s_lfs, &s->h.file, path, flags, &s->file_cfg) < 0) {
         ftp_send_reply(s, fail_msg);
         return -1;
     }
@@ -1474,7 +1539,7 @@ static void cmd_retr(ftp_session_t *s, const char *arg)
 
     /* An unchecked error here would be announced to the client as a negative
      * byte count in the "150" reply. */
-    s->retr_size = lfs_file_size(s_lfs, &s->file);
+    s->retr_size = lfs_file_size(s_lfs, &s->h.file);
     if (s->retr_size < 0) {
         /* Release the file and disarm the mode only — an already-open PASV
          * listener/data connection is untouched, so the client can retry the
@@ -1599,6 +1664,31 @@ static void cmd_abor(ftp_session_t *s, const char *arg)
 }
 
 /**
+ * Answer a failed login and, once FTP_SERVER_MAX_LOGIN_ATTEMPTS of them have
+ * accumulated on one control connection, hang up on it.
+ *
+ * RFC 2577 section 5 asks for this. Without a limit the only bound on guessing
+ * is the idle timer — and every guess resets that timer, so the real bound is
+ * "until the client gives up". The count is deliberately not cleared by a
+ * successful login in between: it limits the connection, not a single attempt
+ * sequence, and a legitimate user who mistypes simply reconnects.
+ */
+static void ftp_login_failed(ftp_session_t *s)
+{
+    s->auth = FTP_STATE_WAIT_USER;
+#if FTP_SERVER_MAX_LOGIN_ATTEMPTS > 0
+    if (++s->login_fails >= FTP_SERVER_MAX_LOGIN_ATTEMPTS) {
+        ftp_send_reply(s, "421 Too many failed login attempts.\r\n");
+        /* Idempotent: ftp_send_reply() may already have torn the session down
+         * because it could not queue the reply. */
+        ftp_close_session(s);
+        return;
+    }
+#endif
+    ftp_send_reply(s, ftp_reply_login_bad);
+}
+
+/**
  * Every path below reassigns s->auth, which is what stops a rejected USER from
  * leaving an earlier successful login standing: the client asked to become
  * somebody else and must not keep what it already had.
@@ -1629,12 +1719,25 @@ static void cmd_user(ftp_session_t *s, const char *arg)
 
     /* No password configured, so there is no later step to defer the answer
      * to and the reply necessarily reveals whether the name was right. */
-    s->auth = user_ok ? FTP_STATE_LOGGED_IN : FTP_STATE_WAIT_USER;
-    ftp_send_reply(s, user_ok ? ftp_reply_login_ok : ftp_reply_login_bad);
+    if (!user_ok) {
+        ftp_login_failed(s);
+        return;
+    }
+    s->auth = FTP_STATE_LOGGED_IN;
+    ftp_send_reply(s, ftp_reply_login_ok);
 }
 
 static void cmd_pass(ftp_session_t *s, const char *arg)
 {
+    /* A client that sends USER and PASS unconditionally must not be turned
+     * away because the USER already logged it in — which is what happens with
+     * authentication disabled, or with a user name but no password. The
+     * password is superfluous, not wrong, so it gets the same 230 the USER
+     * got rather than a sequencing error. */
+    if (s->auth == FTP_STATE_LOGGED_IN) {
+        ftp_send_reply(s, ftp_reply_login_ok);
+        return;
+    }
     if (s->auth != FTP_STATE_WAIT_PASS && s->auth != FTP_STATE_WAIT_PASS_BAD) {
         ftp_send_reply(s, "503 Login with USER first.\r\n");
         return;
@@ -1647,8 +1750,7 @@ static void cmd_pass(ftp_session_t *s, const char *arg)
         s->auth = FTP_STATE_LOGGED_IN;
         ftp_send_reply(s, ftp_reply_login_ok);
     } else {
-        s->auth = FTP_STATE_WAIT_USER;
-        ftp_send_reply(s, ftp_reply_login_bad);
+        ftp_login_failed(s);
     }
 }
 
@@ -1665,7 +1767,16 @@ static void cmd_quit(ftp_session_t *s, const char *arg)
  * `pre_auth` marks the three commands accepted before login; `keeps_rnfr`
  * marks the pair that may leave a pending rename intact (RFC 959: RNTO must
  * directly follow RNFR, anything else cancels it).
+ *
+ * The RFC 775 X-prefixed aliases are compiled in by default but cost an entry
+ * each; FTP_SERVER_ENABLE_X_COMMANDS=0 drops all five.
  */
+#if FTP_SERVER_ENABLE_X_COMMANDS
+#define FTP_CMD_X(name, pre, rnfr, handler) {name, pre, rnfr, handler},
+#else
+#define FTP_CMD_X(name, pre, rnfr, handler)
+#endif
+
 static const struct ftp_cmd ftp_commands[] = {
     /*  name    pre  rnfr  handler   */
     {"USER",     1,   0,   cmd_user},
@@ -1684,11 +1795,11 @@ static const struct ftp_cmd ftp_commands[] = {
     {"MODE",     0,   0,   cmd_mode},
     {"STRU",     0,   0,   cmd_stru},
     {"PWD",      0,   0,   cmd_pwd},
-    {"XPWD",     0,   0,   cmd_pwd},
+    FTP_CMD_X("XPWD",  0, 0, cmd_pwd)
     {"CWD",      0,   0,   cmd_cwd},
-    {"XCWD",     0,   0,   cmd_cwd},
+    FTP_CMD_X("XCWD",  0, 0, cmd_cwd)
     {"CDUP",     0,   0,   cmd_cdup},
-    {"XCUP",     0,   0,   cmd_cdup},
+    FTP_CMD_X("XCUP",  0, 0, cmd_cdup)
     {"PASV",     0,   0,   cmd_pasv},
     {"PORT",     0,   0,   cmd_port},
     {"LIST",     0,   0,   cmd_list},
@@ -1697,9 +1808,9 @@ static const struct ftp_cmd ftp_commands[] = {
     {"STOR",     0,   0,   cmd_stor},
     {"DELE",     0,   0,   cmd_dele},
     {"MKD",      0,   0,   cmd_mkd},
-    {"XMKD",     0,   0,   cmd_mkd},
+    FTP_CMD_X("XMKD",  0, 0, cmd_mkd)
     {"RMD",      0,   0,   cmd_rmd},
-    {"XRMD",     0,   0,   cmd_rmd},
+    FTP_CMD_X("XRMD",  0, 0, cmd_rmd)
     {"RNFR",     0,   1,   cmd_rnfr},
     {"RNTO",     0,   1,   cmd_rnto},
     {"SIZE",     0,   0,   cmd_size},

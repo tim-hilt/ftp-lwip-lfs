@@ -131,4 +131,10 @@ if(FTP_SERVER_BUILD_TESTS)
     ftp_add_server_library(ftp_server_short_data FTP_SERVER_DATA_BUF_SIZE=64)
     ftp_add_test_executable(ftp_tests_short_data tests/test_list_truncation.cpp
         ftp_server_short_data)
+
+    # The obsolete RFC 775 aliases compiled out — see
+    # tests/test_no_x_commands.cpp.
+    ftp_add_server_library(ftp_server_no_x FTP_SERVER_ENABLE_X_COMMANDS=0)
+    ftp_add_test_executable(ftp_tests_no_x tests/test_no_x_commands.cpp
+        ftp_server_no_x)
 endif()
