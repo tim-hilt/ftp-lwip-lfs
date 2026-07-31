@@ -115,7 +115,7 @@ Behavioural details — transfer semantics, resource limits, the RFC 2577 data-c
 
 ## Continuous Integration
 
-`.github/workflows/ci.yml` (workflow name `Build`) runs on every push/PR to `main` with four jobs; `build`, `unit-tests`, and `clang-tidy` are required to pass:
+`.github/workflows/ci.yml` (workflow name `Build`) runs on every push/PR to `main` with five jobs; `build`, `unit-tests`, and `clang-tidy` are required to pass:
 
 | Job           | What it checks                                                          |
 |---------------|--------------------------------------------------------------------------|
@@ -123,8 +123,9 @@ Behavioural details — transfer semantics, resource limits, the RFC 2577 data-c
 | `unit-tests`  | All five Catch2 suites build and pass (see [Testing](#testing)).       |
 | `clang-tidy`  | Static analysis is clean (see below).                                  |
 | `coverage`    | Computes line coverage of `ftp_server.c` (via `gcovr`) after `build`/`unit-tests` pass; on `main` pushes it commits the badge data to `.github/badges/coverage.json`. |
+| `test-badge`  | Re-runs the suites with `ctest --output-junit` after `build`/`unit-tests` pass; on `main` pushes it commits the badge data to `.github/badges/tests.json`. |
 
-The two badges above the project title read this directly: **Build** is GitHub's native workflow badge for the `Build` workflow on `main`; **Coverage** is a [shields.io endpoint badge](https://shields.io/badges/endpoint-badge) pointing at the raw `.github/badges/coverage.json` on `main`, which the `coverage` job keeps up to date.
+The three badges above the project title read this directly: **Build** is GitHub's native workflow badge for the `Build` workflow on `main`; **Coverage** and **Tests** are [shields.io endpoint badges](https://shields.io/badges/endpoint-badge) pointing at the raw `.github/badges/coverage.json` and `.github/badges/tests.json` on `main`, which the `coverage` and `test-badge` jobs keep up to date.
 
 ## Testing
 

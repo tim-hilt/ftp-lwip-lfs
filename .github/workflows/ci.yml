@@ -57,47 +57,8 @@ jobs:
       - name: Generate test badge
         id: tests
         run: |
-          python3 -c "
-import xml.etree.ElementTree as ET
-import json
-
-tree = ET.parse('build/test-results.xml')
-root = tree.getroot()
-total = int(root.get('tests', 0))
-failures = int(root.get('failures', 0))
-skipped = int(root.get('skipped', 0))
-passed = total - failures - skipped
-
-if failures == 0 and skipped == 0:
-    msg = f'{passed} passed'
-elif failures == 0:
-    msg = f'{passed} passed, {skipped} skipped'
-elif skipped == 0:
-    msg = f'{passed} passed, {failures} failed'
-else:
-    msg = f'{passed} passed, {failures} failed, {skipped} skipped'
-
-if failures > 0:
-    color = 'red'
-elif skipped > 0:
-    color = 'yellow'
-else:
-    color = 'brightgreen'
-
-badge = {
-    'schemaVersion': 1,
-    'label': 'tests',
-    'message': msg,
-    'color': color
-}
-
-with open('.github/badges/tests.json', 'w') as f:
-    json.dump(badge, f, indent=2)
-    f.write('\\n')
-
-print(f'msg={msg}')
-print(f'color={color}')
-"
+          mkdir -p .github/badges
+          python3 .github/scripts/gen_test_badge.py build/test-results.xml .github/badges/tests.json
 
       - name: Commit test badge
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -107,7 +68,11 @@ print(f'color={color}')
           git add .github/badges/tests.json
           if ! git diff --cached --quiet; then
             git commit -m "chore: update test badge [skip ci]"
-            git push
+            # The coverage job may push concurrently; rebase and retry.
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push && break
+              sleep 5
+            done
           fi
 
   clang-tidy:
@@ -151,7 +116,7 @@ print(f'color={color}')
         run: |
           gcovr --root . --filter '.*ftp_server\.c$' --merge-mode-functions=merge-use-line-min \
                 --json-summary-pretty --json-summary coverage-summary.json build/
-          pct=$(python3 -c "import json; print(round(json.load(open('coverage-summary.json'))['line_percent'], 1))")
+          pct=$(jq '.line_percent' coverage-summary.json)
           echo "pct=$pct" >> "$GITHUB_OUTPUT"
 
       - name: Generate coverage badge
@@ -179,5 +144,9 @@ print(f'color={color}')
           git add .github/badges/coverage.json
           if ! git diff --cached --quiet; then
             git commit -m "chore: update coverage badge [skip ci]"
-            git push
+            # The test-badge job may push concurrently; rebase and retry.
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push && break
+              sleep 5
+            done
           fi
