@@ -35,6 +35,81 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure
 
+  test-badge:
+    name: test badge
+    runs-on: ubuntu-latest
+    needs: [build, unit-tests]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFTP_SERVER_BUILD_TESTS=ON
+
+      - name: Build tests
+        run: cmake --build build -j
+
+      - name: Run tests and capture JUnit results
+        working-directory: build
+        run: ctest --output-junit test-results.xml --output-on-failure
+
+      - name: Generate test badge
+        id: tests
+        run: |
+          python3 -c "
+import xml.etree.ElementTree as ET
+import json
+
+tree = ET.parse('build/test-results.xml')
+root = tree.getroot()
+total = int(root.get('tests', 0))
+failures = int(root.get('failures', 0))
+skipped = int(root.get('skipped', 0))
+passed = total - failures - skipped
+
+if failures == 0 and skipped == 0:
+    msg = f'{passed} passed'
+elif failures == 0:
+    msg = f'{passed} passed, {skipped} skipped'
+elif skipped == 0:
+    msg = f'{passed} passed, {failures} failed'
+else:
+    msg = f'{passed} passed, {failures} failed, {skipped} skipped'
+
+if failures > 0:
+    color = 'red'
+elif skipped > 0:
+    color = 'yellow'
+else:
+    color = 'brightgreen'
+
+badge = {
+    'schemaVersion': 1,
+    'label': 'tests',
+    'message': msg,
+    'color': color
+}
+
+with open('.github/badges/tests.json', 'w') as f:
+    json.dump(badge, f, indent=2)
+    f.write('\\n')
+
+print(f'msg={msg}')
+print(f'color={color}')
+"
+
+      - name: Commit test badge
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/tests.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update test badge [skip ci]"
+            git push
+          fi
+
   clang-tidy:
     name: static analysis (clang-tidy)
     runs-on: ubuntu-latest

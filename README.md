@@ -2,6 +2,7 @@
 
 [![Build](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml?query=branch%3Amain)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tim-hilt/ftp-lwip-lfs/main/.github/badges/coverage.json)](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml?query=branch%3Amain)
+[![Tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tim-hilt/ftp-lwip-lfs/main/.github/badges/tests.json)](https://github.com/tim-hilt/ftp-lwip-lfs/actions/workflows/ci.yml?query=branch%3Amain)
 
 A minimal FTP server for embedded systems, built on the [lwIP](https://savannah.nongnu.org/projects/lwip/) raw TCP API and backed by a [LittleFS](https://github.com/littlefs-project/littlefs) filesystem. It exposes a small C API (`ftp_server.h`) intended to be dropped into a microcontroller firmware project.
 
